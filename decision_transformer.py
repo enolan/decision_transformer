@@ -51,8 +51,11 @@ class DecisionTransformer(pl.LightningModule):
         self.vqgan_tokens = (output_resolution // vqgan_token_size) ** 2
 
         self.setup_positional_encoding()
+        self.setup_attention_mask()
 
-        transformer_encoder_layer = torch.nn.TransformerEncoderLayer(d_model, n_head)
+        transformer_encoder_layer = torch.nn.TransformerEncoderLayer(
+            d_model, n_head, batch_first=True
+        )
         self.encoder = torch.nn.TransformerEncoder(transformer_encoder_layer, n_layers)
 
         self.decoder_vqgan_tokens = torch.nn.Linear(d_model, vqgan_model.quantize.n_e)
@@ -70,18 +73,19 @@ class DecisionTransformer(pl.LightningModule):
 
         inputs = inputs + self.positional
 
-        encoded = self.encoder(inputs)
+        encoded = self.encoder(inputs, mask=self.attn_mask)
         vqgan_probs = self.decoder_vqgan_tokens(encoded)[
             :, 2:
         ]  # logged and unnormalized probabilities
         cos_sim_pred = self.decoder_cos_sim(encoded)[:, 1]
 
         patches_loss = F.cross_entropy(
-            vqgan_probs.reshape(-1, self.vqgan_model.quantize.n_e), tokenses.reshape(-1)
+            vqgan_probs.reshape(-1, self.vqgan_model.quantize.n_e),
+            tokenses.reshape(-1),
         )
         cos_sim_loss = F.mse_loss(cos_sim_pred, cos_sims)
-
-        # we have no loss for the target CLIP embedding since we never want to learn it
+        # we have no loss for the target CLIP embedding since we never want
+        # to learn it
 
         return 2 * cos_sim_loss + patches_loss  # mess with the scaling constant?
 
@@ -91,7 +95,9 @@ class DecisionTransformer(pl.LightningModule):
         # similarity, treated specially.
 
         self.register_buffer(
-            "positional", torch.zeros(self.d_model).repeat(self.vqgan_tokens + 2, 1)
+            "positional",
+            torch.zeros(self.d_model).repeat(self.vqgan_tokens + 2, 1),
+            persistent=False,
         )
         self.positional[0][0] = 1.0
         self.positional[1][1] = 1.0
@@ -105,6 +111,21 @@ class DecisionTransformer(pl.LightningModule):
         pos_e[:, 0::2] = torch.sin(token_idxs * div_term)
         pos_e[:, 1::2] = torch.cos(token_idxs * div_term)
         self.positional[2:, 2:] = pos_e
+
+    def setup_attention_mask(self):
+        self.register_buffer(
+            "attn_mask",
+            torch.triu(
+                torch.ones(self.vqgan_tokens + 2, self.vqgan_tokens + 2)
+                * float("-inf"),
+                diagonal=1
+                # this seems wrong? but it makes everything NaN otherwise. It
+                # means the first token output is allowed to attend to itself.
+                # Which shouldn't matter in this application but is still
+                # wrong.
+            ),
+            persistent=False,
+        )
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters())
@@ -154,11 +175,11 @@ def test_dummy_train():
     dl = DataLoader(
         TensorDataset(dummy_clip_targets, dummy_cos_sims, dummy_vqgan_tokens),
         pin_memory=True,
-        batch_size=512,
+        batch_size=64,
     )
 
     loss_recorder = TrainLossRecorder()
-    trainer = pl.Trainer(gpus=1, max_epochs=100, callbacks=[loss_recorder])
+    trainer = pl.Trainer(gpus=1, max_epochs=30, callbacks=[loss_recorder])
     trainer.fit(dt_model, dl)
 
     assert loss_recorder.train_loss < 0.01
