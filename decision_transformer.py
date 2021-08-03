@@ -41,37 +41,29 @@ class DecisionTransformer(pl.LightningModule):
         self.decoder_cos_sim = torch.nn.Linear(d_model, 1)
 
     def training_step(self, batch, batch_idx):
-        # print(list(self.named_buffers()))
-
         targets, cos_sims, tokenses = batch
         targets_e = self.clip_embedding_linear(targets)
         cos_sims_e = self.clip_similarity_linear(cos_sims)
         tokenses_e = self.vqgan_embedding(tokenses)
-        # print(f"targets {targets_e.shape} cos_sims {cos_sims_e.shape} tokenses_e {tokenses_e.shape}")
 
         inputs = torch.cat(
             [targets_e.unsqueeze(1), cos_sims_e.unsqueeze(1), tokenses_e], axis=1
         )
-        # print(f"inputs {inputs.shape}")
 
-        # print(inputs.device)
-        # print(self.positional.device)
         inputs = inputs + self.positional
-        # print(inputs)
 
         encoded = self.encoder(inputs)
-        # we have no loss for the target CLIP embedding since we never want to learn it
         vqgan_probs = self.decoder_vqgan_tokens(encoded)[
             :, 2:
         ]  # logged and unnormalized probabilities
         cos_sim_pred = self.decoder_cos_sim(encoded)[:, 1]
-        # print(f"encoded {encoded.shape}, vqgan_probs {vqgan_probs.shape}, cos_sim_pred {cos_sim_pred.shape}")
 
         patches_loss = F.cross_entropy(
             vqgan_probs.reshape(-1, self.vqgan_model.quantize.n_e), tokenses.reshape(-1)
         )
         cos_sim_loss = F.mse_loss(cos_sim_pred, cos_sims)
 
+        # we have no loss for the target CLIP embedding since we never want to learn it
         return 2 * cos_sim_loss + patches_loss  # mess with the scaling constant?
 
     def setup_positional_encoding(self):
