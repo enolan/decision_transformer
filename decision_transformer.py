@@ -10,14 +10,31 @@ from torch.utils.data import DataLoader, TensorDataset
 
 
 class DecisionTransformer(pl.LightningModule):
+    """Main modified decision transformer model.
+    Basic idea is we use an autoregressive transformer to model sequences of:
+    1. Target CLIP embedding
+    2. Cosine similarity of image embedding with target
+    3. Sequence of VQGAN patches
+
+    Generating the images is then a matter of picking a target CLIP embedding,
+    sampling to find a plausible cosine similarity, then sampling the series of
+    tokens that encode the image.
+
+    This is basically the same as Katherine Crowson's decision transformer
+    model, the difference is that this is trained without the use of image
+    labels - we do some "data augmentation" on unlabeled images to generate our
+    training data. Hopefully this lets us get more diverse outputs without a
+    need for manually labeled data.
+    """
+
     def __init__(
         self, d_model, n_head, n_layers, clip_model, vqgan_model, output_resolution
     ):
         super().__init__()
 
         self.vqgan_model = vqgan_model
-
         self.d_model = d_model
+
         # A linear layer embedding CLIP embeddings into our space.
         self.clip_embedding_linear = torch.nn.Linear(
             clip_model.visual.output_dim, d_model
@@ -30,6 +47,7 @@ class DecisionTransformer(pl.LightningModule):
         # How wide are the VQGAN patches?
         vqgan_token_size = 2 ** (vqgan_model.decoder.num_resolutions - 1)
         assert output_resolution % vqgan_token_size == 0
+        # How many VQGAN tokens are there in an image?
         self.vqgan_tokens = (output_resolution // vqgan_token_size) ** 2
 
         self.setup_positional_encoding()
@@ -64,13 +82,13 @@ class DecisionTransformer(pl.LightningModule):
         cos_sim_loss = F.mse_loss(cos_sim_pred, cos_sims)
 
         # we have no loss for the target CLIP embedding since we never want to learn it
+
         return 2 * cos_sim_loss + patches_loss  # mess with the scaling constant?
 
     def setup_positional_encoding(self):
         # Output tensor is (vqgan_tokens + 2, d_model)
         # Two extra tokens for the target CLIP embedding and the cosine
         # similarity, treated specially.
-        # order might be wrong?
 
         self.register_buffer(
             "positional", torch.zeros(self.d_model).repeat(self.vqgan_tokens + 2, 1)
@@ -93,6 +111,8 @@ class DecisionTransformer(pl.LightningModule):
 
 
 class TrainLossRecorder(pl.Callback):
+    "Tool for recording the training loss."
+
     def __init__(self):
         self.train_loss = None
 
@@ -103,6 +123,7 @@ class TrainLossRecorder(pl.Callback):
 
 
 def setup_clip_and_vqgan(want_vqgan_weights=True):
+    "Load the models we depend on."
     clip_model, _clip_preprocessor = clip.load("ViT-B/32")
     vqgan_config = OmegaConf.load("models/vqgan_imagenet_f16_16384.yaml")
     vqgan_model = vqgan.VQModel(**vqgan_config.model.params)
@@ -118,6 +139,7 @@ def test_can_init_dt():
 
 
 def test_dummy_train():
+    "Check we can memorize a trivial dataset."
     clip_model, vqgan_model = setup_clip_and_vqgan(want_vqgan_weights=False)
     dt_model = DecisionTransformer(16, 4, 4, clip_model, vqgan_model, 64)
     dummy_clip_target = torch.zeros(clip_model.visual.output_dim)
