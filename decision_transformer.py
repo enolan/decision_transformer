@@ -87,12 +87,14 @@ class DecisionTransformer(pl.LightningModule):
         imgs_tensor, _ = batch
         batch_size = imgs_tensor.shape[0]
 
-        # Encode with VQGAN
-        vqgan_zs, _embedding_loss, [_, _, vqgan_tokenses] = self.vqgan_model.encode(
-            imgs_tensor * 2 - 1
-        )
+        # Encode with VQGAN - does not play well with mixed precision
+        with torch.cuda.amp.autocast(False):
+            vqgan_zs, _embedding_loss, [_, _, vqgan_tokenses] = self.vqgan_model.encode(
+                imgs_tensor * 2 - 1
+            )
+            assert not vqgan_zs.isnan().any().item()
 
-        reconstructed_imgs = self.vqgan_model.decode(vqgan_zs)
+            reconstructed_imgs = self.vqgan_model.decode(vqgan_zs)
 
         # Stick a reconstructed example in TensorBoard for debug purposes
         if random.random() <= 0.05:
@@ -108,9 +110,11 @@ class DecisionTransformer(pl.LightningModule):
 
         # Process with CLIP
         reconstructed_for_clip = self.normalize_for_clip(reconstructed_imgs)
+
         clip_embeddings = self.clip_model.encode_image(reconstructed_for_clip).type_as(
             reconstructed_for_clip
         )
+
         cos_sims = torch.ones(batch_size).type_as(clip_embeddings).unsqueeze(1)
 
         vqgan_tokenses = vqgan_tokenses.reshape(batch_size, -1)
@@ -146,8 +150,6 @@ class DecisionTransformer(pl.LightningModule):
         # we have no loss for the target CLIP embedding since we never want
         # to learn it
 
-        assert not cos_sim_loss.isnan().item()
-        assert not patches_loss.isnan().item()
         loss = 2 * cos_sim_loss + patches_loss  # mess with the scaling constant?
         assert not loss.isnan().item()
         self.log("train/loss", loss)
@@ -165,7 +167,7 @@ class DecisionTransformer(pl.LightningModule):
             toks = self.positional.unsqueeze(0)
             toks[0][0] = target_e + toks[0][0]
 
-            #print(f"toks {toks}")
+            # print(f"toks {toks}")
 
             cos_sim_candidates = []
             for _ in range(100):  # How many samples do we need? 100 is asspulled
@@ -173,26 +175,28 @@ class DecisionTransformer(pl.LightningModule):
                 pred_cos_sim = self.decoder_cos_sim(encoded)
                 cos_sim_candidates.append(pred_cos_sim)
             cos_sim_candidates, _idxs = torch.cat(cos_sim_candidates).sort()
-            #print(f"cos_sim_candidates {cos_sim_candidates}")
+            # print(f"cos_sim_candidates {cos_sim_candidates}")
 
             # 90th percentile is asspulled too
             cos_sim_target = cos_sim_candidates[int(len(cos_sim_candidates) * 0.90)]
-            #print(f"cos_sim_target {cos_sim_target}")
+            # print(f"cos_sim_target {cos_sim_target}")
 
             toks[0, 1] = toks[0, 1] + self.decoder_cos_sim(cos_sim_target.unsqueeze(0))
 
             vqgan_toks = []
 
             for i in range(self.vqgan_tokens):
-                #print(f"toks {toks}")
+                # print(f"toks {toks}")
 
                 # Could do top-p sampling here, or one of the other ones. Doing
                 # the simplest approach for now.
                 encoded = self.encoder(toks, mask=self.attn_mask)[0, i + 1]
-                vqgan_token_probabilities = self.decoder_vqgan_tokens(encoded.unsqueeze(0))
+                vqgan_token_probabilities = self.decoder_vqgan_tokens(
+                    encoded.unsqueeze(0)
+                )
                 vqgan_token_probabilities = vqgan_token_probabilities.softmax(1)
                 sampled_toks = vqgan_token_probabilities.multinomial(1)
-                #print(f"sampled_toks {sampled_toks}")
+                # print(f"sampled_toks {sampled_toks}")
                 toks[0, i + 2] = self.vqgan_embedding(sampled_toks[0, 0])
                 vqgan_toks.append(sampled_toks[0, 0])
 
@@ -207,7 +211,6 @@ class DecisionTransformer(pl.LightningModule):
             z = z.transpose(2, 3)
             print(f"z {z.shape}")
             return ((self.vqgan_model.decode(z)[0] + 1) / 2).clamp(0, 1)
-
 
     def setup_positional_encoding(self):
         # Output tensor is (vqgan_tokens + 2, d_model)
@@ -380,5 +383,7 @@ if __name__ == "__main__":
         shuffle=True,
     )
 
-    trainer = pl.Trainer(gpus=1, log_every_n_steps=1, callbacks=[eval_callback])
+    trainer = pl.Trainer(
+        gpus=1, log_every_n_steps=1, callbacks=[eval_callback], precision=16
+    )
     trainer.fit(dt_model, dl)
