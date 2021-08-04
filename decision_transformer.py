@@ -95,14 +95,14 @@ class DecisionTransformer(pl.LightningModule):
         reconstructed_imgs = self.vqgan_model.decode(vqgan_zs)
 
         # Stick a reconstructed example in TensorBoard for debug purposes
-        if random.random() <= 0.2:
+        if random.random() <= 0.05:
             idx = random.randint(0, batch_size - 1)
             self.logger.experiment.add_image(
                 f"original/{self.logged_reconstructions}", imgs_tensor[idx]
             )
             self.logger.experiment.add_image(
                 f"reconstructed/{self.logged_reconstructions}",
-                ((reconstructed_imgs[idx] + 1) / 2).clamp(0, 1)
+                ((reconstructed_imgs[idx] + 1) / 2).clamp(0, 1),
             )
             self.logged_reconstructions = self.logged_reconstructions + 1
 
@@ -127,25 +127,84 @@ class DecisionTransformer(pl.LightningModule):
         inputs = inputs + self.positional
 
         encoded = self.encoder(inputs, mask=self.attn_mask)
-        vqgan_probs = self.decoder_vqgan_tokens(encoded)[
-            :, 2:
-        ]  # logged and unnormalized probabilities
-        cos_sim_pred = self.decoder_cos_sim(encoded)[:, 1]
 
+        # all predictions are offset by 1. I.e. output n is a prediction for
+        # token n + 1
+        cos_sim_pred = self.decoder_cos_sim(encoded)[:, 0]
+        cos_sim_loss = F.mse_loss(cos_sim_pred, cos_sims)
+        self.log("train/cos_sim_loss", cos_sim_loss)
+
+        vqgan_probs = self.decoder_vqgan_tokens(encoded)[
+            :, 1:-1
+        ]  # logged and unnormalized probabilities
         patches_loss = F.cross_entropy(
             vqgan_probs.reshape(-1, self.vqgan_model.quantize.n_embed),
             vqgan_tokenses.reshape(-1),
         )
         self.log("train/patches_loss", patches_loss)
 
-        cos_sim_loss = F.mse_loss(cos_sim_pred, cos_sims)
-        self.log("train/cos_sim_loss", cos_sim_loss)
         # we have no loss for the target CLIP embedding since we never want
         # to learn it
 
         loss = 2 * cos_sim_loss + patches_loss  # mess with the scaling constant?
         self.log("train/loss", loss)
         return loss
+
+    def forward(self, target_clip_embedding):
+        with torch.no_grad():
+            # Enable dropout for MC sampling
+            for m in self.modules():
+                if m.__class__.__name__.startswith("Dropout"):
+                    m.train()
+
+            target_e = self.clip_embedding_linear(target_clip_embedding)
+
+            toks = self.positional.unsqueeze(0)
+            toks[0][0] = target_e + toks[0][0]
+
+            #print(f"toks {toks}")
+
+            cos_sim_candidates = []
+            for _ in range(100):  # How many samples do we need? 100 is asspulled
+                encoded = self.encoder(toks, mask=self.attn_mask)[0, 0]
+                pred_cos_sim = self.decoder_cos_sim(encoded)
+                cos_sim_candidates.append(pred_cos_sim)
+            cos_sim_candidates, _idxs = torch.cat(cos_sim_candidates).sort()
+            #print(f"cos_sim_candidates {cos_sim_candidates}")
+
+            # 90th percentile is asspulled too
+            cos_sim_target = cos_sim_candidates[int(len(cos_sim_candidates) * 0.90)]
+            #print(f"cos_sim_target {cos_sim_target}")
+
+            toks[0, 1] = toks[0, 1] + self.decoder_cos_sim(cos_sim_target.unsqueeze(0))
+
+            vqgan_toks = []
+
+            for i in range(self.vqgan_tokens):
+                #print(f"toks {toks}")
+
+                # Could do top-p sampling here, or one of the other ones. Doing
+                # the simplest approach for now.
+                encoded = self.encoder(toks, mask=self.attn_mask)[0, i + 1]
+                vqgan_token_probabilities = self.decoder_vqgan_tokens(encoded.unsqueeze(0))
+                vqgan_token_probabilities = vqgan_token_probabilities.softmax(1)
+                sampled_toks = vqgan_token_probabilities.multinomial(1)
+                #print(f"sampled_toks {sampled_toks}")
+                toks[0, i + 2] = self.vqgan_embedding(sampled_toks[0, 0])
+                vqgan_toks.append(sampled_toks[0, 0])
+
+            img_res_in_tokens = int(math.sqrt(self.vqgan_tokens))
+
+            vqgan_toks = torch.stack(vqgan_toks)
+            print(f"vqgan_toks {vqgan_toks}")
+            z = self.vqgan_model.quantize.embed(vqgan_toks)
+            print(f"z {z} {z.shape}")
+            z = z.reshape((1, img_res_in_tokens, img_res_in_tokens, -1))
+            z = z.transpose(1, 3)
+            z = z.transpose(2, 3)
+            print(f"z {z.shape}")
+            return ((self.vqgan_model.decode(z)[0] + 1) / 2).clamp(0, 1)
+
 
     def setup_positional_encoding(self):
         # Output tensor is (vqgan_tokens + 2, d_model)
@@ -199,6 +258,25 @@ class TrainLossRecorder(pl.Callback):
         self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx
     ):
         self.train_loss = outputs["loss"].item()
+
+
+class EvalEveryEpoch(pl.Callback):
+    def __init__(self, prompts, model):
+        self.prompts = []
+
+        with torch.no_grad():
+            for prompt in prompts:
+                tokens = clip.tokenize([prompt]).cuda()
+                embedding = model.clip_model.encode_text(tokens).float()
+                self.prompts.append({"prompt": prompt, "embedding": embedding})
+
+        self.ctr = 0
+
+    def on_train_epoch_start(self, trainer, pl):
+        for prompt in self.prompts:
+            img = pl.forward(prompt["embedding"])
+            pl.logger.experiment.add_image(f"{prompt['prompt']}/{self.ctr}", img)
+        self.ctr = self.ctr + 1
 
 
 def setup_clip_and_vqgan(want_vqgan_weights=True):
@@ -279,7 +357,11 @@ if __name__ == "__main__":
     clip_model, clip_preprocessor, vqgan_model = setup_clip_and_vqgan(
         want_vqgan_weights=True
     )
-    dt_model = DecisionTransformer(16, 4, 4, clip_model, vqgan_model, output_res)
+    dt_model = DecisionTransformer(64, 4, 4, clip_model, vqgan_model, output_res)
+
+    eval_callback = EvalEveryEpoch(
+        ["a sad man's face", "a group of women", "a man giving a speech"], dt_model
+    )
 
     dl = DataLoader(
         torchvision.datasets.ImageFolder(
@@ -295,5 +377,5 @@ if __name__ == "__main__":
         shuffle=True,
     )
 
-    trainer = pl.Trainer(gpus=1, log_every_n_steps=1)
+    trainer = pl.Trainer(gpus=1, log_every_n_steps=1, callbacks=[eval_callback])
     trainer.fit(dt_model, dl)
