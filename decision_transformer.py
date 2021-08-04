@@ -1,7 +1,10 @@
 import clip
 import math
 from omegaconf import OmegaConf
+import os
+import PIL
 import pytorch_lightning as pl
+import random
 from taming.models import vqgan
 import torch
 import torch.nn
@@ -36,6 +39,7 @@ class DecisionTransformer(pl.LightningModule):
         self.vqgan_model = vqgan_model
         self.clip_model = clip_model
         self.d_model = d_model
+        self.logged_reconstructions = 0
 
         # A linear layer embedding CLIP embeddings into our space.
         self.clip_embedding_linear = torch.nn.Linear(
@@ -89,6 +93,18 @@ class DecisionTransformer(pl.LightningModule):
         )
 
         reconstructed_imgs = self.vqgan_model.decode(vqgan_zs)
+
+        # Stick a reconstructed example in TensorBoard for debug purposes
+        if random.random() <= 0.2:
+            idx = random.randint(0, batch_size - 1)
+            self.logger.experiment.add_image(
+                f"original/{self.logged_reconstructions}", imgs_tensor[idx]
+            )
+            self.logger.experiment.add_image(
+                f"reconstructed/{self.logged_reconstructions}",
+                ((reconstructed_imgs[idx] + 1) / 2).clamp(0, 1)
+            )
+            self.logged_reconstructions = self.logged_reconstructions + 1
 
         # Process with CLIP
         reconstructed_for_clip = self.normalize_for_clip(reconstructed_imgs)
@@ -248,9 +264,18 @@ def transform_image(img, target_res, clip_model, clip_preprocessor, vqgan_model)
     return torchvision.transforms.functional.to_tensor(transform(img))
 
 
+def clean_img_dir(dir):
+    for path in os.listdir(dir):
+        try:
+            PIL.Image.open(f"{dir}/{path}").copy()
+        except (PIL.UnidentifiedImageError, OSError):
+            print(f"Deleting {path}")
+            os.remove(f"{dir}/{path}")
+
+
 if __name__ == "__main__":
 
-    output_res = 64
+    output_res = 256
     clip_model, clip_preprocessor, vqgan_model = setup_clip_and_vqgan(
         want_vqgan_weights=True
     )
@@ -265,14 +290,10 @@ if __name__ == "__main__":
             is_valid_file=lambda p: p.endswith("bmp"),
         ),
         pin_memory=True,
-        batch_size=64,
+        batch_size=8,
         num_workers=8,
+        shuffle=True,
     )
 
-    profiler = pl.profiler.PyTorchProfiler(
-        filename="profile",
-        with_stack=True,
-        on_trace_ready=torch.profiler.tensorboard_trace_handler("tb-prof-logs"),
-    )
-    trainer = pl.Trainer(gpus=1, max_epochs=5, profiler=profiler, log_every_n_steps=1)
+    trainer = pl.Trainer(gpus=1, log_every_n_steps=1)
     trainer.fit(dt_model, dl)
