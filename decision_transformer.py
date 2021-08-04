@@ -146,7 +146,10 @@ class DecisionTransformer(pl.LightningModule):
         # we have no loss for the target CLIP embedding since we never want
         # to learn it
 
+        assert not cos_sim_loss.isnan().item()
+        assert not patches_loss.isnan().item()
         loss = 2 * cos_sim_loss + patches_loss  # mess with the scaling constant?
+        assert not loss.isnan().item()
         self.log("train/loss", loss)
         return loss
 
