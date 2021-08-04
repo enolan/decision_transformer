@@ -218,22 +218,17 @@ def test_dummy_train():
 
     copies = 4096
 
-    dummy_clip_targets = dummy_clip_target.unsqueeze(0).repeat(copies, 1)
-    dummy_cos_sims = torch.ones(1).unsqueeze(0).repeat(copies, 1)
-    dummy_vqgan_tokens = (
-        torch.zeros(16, dtype=torch.long).unsqueeze(0).repeat(copies, 1)
-    )
-    dummy_targets = torch.zeros(copies).long().unsqueeze(0)
+    dummy_imgs = torch.zeros(copies, 3, 64, 64)
+    dummy_targets = torch.zeros(copies, 1)
+
     dl = DataLoader(
-        TensorDataset(
-            (dummy_clip_targets, dummy_cos_sims, dummy_vqgan_tokens), dummy_targets
-        ),
+        TensorDataset(dummy_imgs, dummy_targets),
         pin_memory=True,
-        batch_size=64,
+        batch_size=16,
     )
 
     loss_recorder = TrainLossRecorder()
-    trainer = pl.Trainer(gpus=1, max_epochs=30, callbacks=[loss_recorder])
+    trainer = pl.Trainer(gpus=1, max_epochs=35, callbacks=[loss_recorder])
     trainer.fit(dt_model, dl)
 
     assert loss_recorder.train_loss < 0.01
