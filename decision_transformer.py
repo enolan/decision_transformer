@@ -7,6 +7,7 @@ import torch
 import torch.nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
+import torchvision
 
 
 class DecisionTransformer(pl.LightningModule):
@@ -33,6 +34,7 @@ class DecisionTransformer(pl.LightningModule):
         super().__init__()
 
         self.vqgan_model = vqgan_model
+        self.clip_model = clip_model
         self.d_model = d_model
 
         # A linear layer embedding CLIP embeddings into our space.
@@ -42,7 +44,7 @@ class DecisionTransformer(pl.LightningModule):
         # A linear layer embedding CLIP similarities
         self.clip_similarity_linear = torch.nn.Linear(1, d_model)
         # Embedding for VQGAN tokens
-        self.vqgan_embedding = torch.nn.Embedding(vqgan_model.quantize.n_e, d_model)
+        self.vqgan_embedding = torch.nn.Embedding(vqgan_model.quantize.n_embed, d_model)
 
         # How wide are the VQGAN patches?
         vqgan_token_size = 2 ** (vqgan_model.decoder.num_resolutions - 1)
@@ -52,20 +54,55 @@ class DecisionTransformer(pl.LightningModule):
 
         self.setup_positional_encoding()
         self.setup_attention_mask()
+        self.normalize_for_clip = torchvision.transforms.Compose(
+            [
+                torchvision.transforms.Resize(
+                    [
+                        clip_model.visual.input_resolution,
+                        clip_model.visual.input_resolution,
+                    ]
+                ),
+                torchvision.transforms.Normalize(
+                    mean=[0.48145466, 0.4578275, 0.40821073],
+                    std=[0.26862954, 0.26130258, 0.27577711],
+                ),
+            ]
+        )
 
         transformer_encoder_layer = torch.nn.TransformerEncoderLayer(
             d_model, n_head, batch_first=True
         )
         self.encoder = torch.nn.TransformerEncoder(transformer_encoder_layer, n_layers)
 
-        self.decoder_vqgan_tokens = torch.nn.Linear(d_model, vqgan_model.quantize.n_e)
+        self.decoder_vqgan_tokens = torch.nn.Linear(
+            d_model, vqgan_model.quantize.n_embed
+        )
         self.decoder_cos_sim = torch.nn.Linear(d_model, 1)
 
     def training_step(self, batch, batch_idx):
-        targets, cos_sims, tokenses = batch
-        targets_e = self.clip_embedding_linear(targets)
+        imgs_tensor, _ = batch
+        batch_size = imgs_tensor.shape[0]
+
+        # Encode with VQGAN
+        vqgan_zs, _embedding_loss, [_, _, vqgan_tokenses] = self.vqgan_model.encode(
+            imgs_tensor * 2 - 1
+        )
+
+        reconstructed_imgs = self.vqgan_model.decode(vqgan_zs)
+
+        # Process with CLIP
+        reconstructed_for_clip = self.normalize_for_clip(reconstructed_imgs)
+        clip_embeddings = self.clip_model.encode_image(reconstructed_for_clip).type_as(
+            reconstructed_for_clip
+        )
+        cos_sims = torch.ones(batch_size).type_as(clip_embeddings).unsqueeze(1)
+
+        vqgan_tokenses = vqgan_tokenses.reshape(batch_size, -1)
+        # TODO data augmentation, fuzz the target and compute cosine similarity
+        # to fuzzed target
+        targets_e = self.clip_embedding_linear(clip_embeddings)
         cos_sims_e = self.clip_similarity_linear(cos_sims)
-        tokenses_e = self.vqgan_embedding(tokenses)
+        tokenses_e = self.vqgan_embedding(vqgan_tokenses)
 
         inputs = torch.cat(
             [targets_e.unsqueeze(1), cos_sims_e.unsqueeze(1), tokenses_e], axis=1
@@ -80,14 +117,19 @@ class DecisionTransformer(pl.LightningModule):
         cos_sim_pred = self.decoder_cos_sim(encoded)[:, 1]
 
         patches_loss = F.cross_entropy(
-            vqgan_probs.reshape(-1, self.vqgan_model.quantize.n_e),
-            tokenses.reshape(-1),
+            vqgan_probs.reshape(-1, self.vqgan_model.quantize.n_embed),
+            vqgan_tokenses.reshape(-1),
         )
+        self.log("train/patches_loss", patches_loss)
+
         cos_sim_loss = F.mse_loss(cos_sim_pred, cos_sims)
+        self.log("train/cos_sim_loss", cos_sim_loss)
         # we have no loss for the target CLIP embedding since we never want
         # to learn it
 
-        return 2 * cos_sim_loss + patches_loss  # mess with the scaling constant?
+        loss = 2 * cos_sim_loss + patches_loss  # mess with the scaling constant?
+        self.log("train/loss", loss)
+        return loss
 
     def setup_positional_encoding(self):
         # Output tensor is (vqgan_tokens + 2, d_model)
@@ -145,23 +187,32 @@ class TrainLossRecorder(pl.Callback):
 
 def setup_clip_and_vqgan(want_vqgan_weights=True):
     "Load the models we depend on."
-    clip_model, _clip_preprocessor = clip.load("ViT-B/32")
-    vqgan_config = OmegaConf.load("models/vqgan_imagenet_f16_16384.yaml")
-    vqgan_model = vqgan.VQModel(**vqgan_config.model.params)
+    clip_model, clip_preprocessor = clip.load("ViT-B/32")
+    clip_model.eval().requires_grad_(False)
+
+    vqgan_config = OmegaConf.load("models/vqgan_gumbel_openimages_f8_8192.yaml")
+    vqgan_model = vqgan.GumbelVQ(**vqgan_config.model.params)
     if want_vqgan_weights:
-        vqgan_model.init_from_ckpt("models/vqgan_imagenet_f16_16384.ckpt")
-    return clip_model, vqgan_model
+        vqgan_model.init_from_ckpt("models/vqgan_gumbel_openimages_f8_8192.ckpt")
+    del vqgan_model.loss
+    vqgan_model.eval().requires_grad_(False)
+
+    return clip_model, clip_preprocessor, vqgan_model
 
 
 def test_can_init_dt():
     "Check setting up a DT module works"
-    clip_model, vqgan_model = setup_clip_and_vqgan(want_vqgan_weights=False)
+    clip_model, _clip_preprocessor, vqgan_model = setup_clip_and_vqgan(
+        want_vqgan_weights=False
+    )
     DecisionTransformer(16, 4, 4, clip_model, vqgan_model, 64)
 
 
 def test_dummy_train():
     "Check we can memorize a trivial dataset."
-    clip_model, vqgan_model = setup_clip_and_vqgan(want_vqgan_weights=False)
+    clip_model, _clip_preprocessor, vqgan_model = setup_clip_and_vqgan(
+        want_vqgan_weights=False
+    )
     dt_model = DecisionTransformer(16, 4, 4, clip_model, vqgan_model, 64)
     dummy_clip_target = torch.zeros(clip_model.visual.output_dim)
 
@@ -172,8 +223,11 @@ def test_dummy_train():
     dummy_vqgan_tokens = (
         torch.zeros(16, dtype=torch.long).unsqueeze(0).repeat(copies, 1)
     )
+    dummy_targets = torch.zeros(copies).long().unsqueeze(0)
     dl = DataLoader(
-        TensorDataset(dummy_clip_targets, dummy_cos_sims, dummy_vqgan_tokens),
+        TensorDataset(
+            (dummy_clip_targets, dummy_cos_sims, dummy_vqgan_tokens), dummy_targets
+        ),
         pin_memory=True,
         batch_size=64,
     )
@@ -183,3 +237,47 @@ def test_dummy_train():
     trainer.fit(dt_model, dl)
 
     assert loss_recorder.train_loss < 0.01
+
+
+def transform_image(img, target_res, clip_model, clip_preprocessor, vqgan_model):
+    "Transform a PIL image into the appropriate tensors"
+
+    # Fit to size
+    smaller_dim = min(img.width, img.height)
+    transform = torchvision.transforms.Compose(
+        [
+            torchvision.transforms.RandomCrop(smaller_dim),
+            torchvision.transforms.Resize((target_res, target_res)),
+        ]
+    )
+    return torchvision.transforms.functional.to_tensor(transform(img))
+
+
+if __name__ == "__main__":
+
+    output_res = 64
+    clip_model, clip_preprocessor, vqgan_model = setup_clip_and_vqgan(
+        want_vqgan_weights=True
+    )
+    dt_model = DecisionTransformer(16, 4, 4, clip_model, vqgan_model, output_res)
+
+    dl = DataLoader(
+        torchvision.datasets.ImageFolder(
+            "/run/user/1000/learndata",
+            transform=lambda img: transform_image(
+                img, output_res, clip_model, clip_preprocessor, vqgan_model
+            ),
+            is_valid_file=lambda p: p.endswith("bmp"),
+        ),
+        pin_memory=True,
+        batch_size=64,
+        num_workers=8,
+    )
+
+    profiler = pl.profiler.PyTorchProfiler(
+        filename="profile",
+        with_stack=True,
+        on_trace_ready=torch.profiler.tensorboard_trace_handler("tb-prof-logs"),
+    )
+    trainer = pl.Trainer(gpus=1, max_epochs=5, profiler=profiler, log_every_n_steps=1)
+    trainer.fit(dt_model, dl)
