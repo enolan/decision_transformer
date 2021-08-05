@@ -115,7 +115,31 @@ class DecisionTransformer(pl.LightningModule):
             reconstructed_for_clip
         )
 
-        cos_sims = torch.ones(batch_size).type_as(clip_embeddings).unsqueeze(1)
+        # We add gaussian noise to the CLIP target vectors and shuffle them in
+        # order to force the model to learn the CLIP embedding ->
+        # (image, cos similarity) function.
+        clip_fuzzed_targets = (
+            clip_embeddings
+            + torch.distributions.normal.Normal(
+                torch.zeros(
+                    [batch_size, clip_model.visual.output_dim], device=self.device
+                ),
+                torch.tensor([1], device=self.device),
+            ).sample()
+        )
+        clip_fuzzed_targets = clip_fuzzed_targets / torch.linalg.vector_norm(
+            clip_fuzzed_targets, dim=1, keepdim=True
+        )
+
+        clip_fuzzed_targets = clip_fuzzed_targets[torch.randperm(batch_size)]
+
+        cos_sims = torch.nn.functional.cosine_similarity(
+            clip_embeddings, clip_fuzzed_targets
+        ).unsqueeze(1)
+
+        self.logger.experiment.add_histogram(
+            "train/cosine_similarities", cos_sims[:, 0], global_step=self.global_step
+        )
 
         vqgan_tokenses = vqgan_tokenses.reshape(batch_size, -1)
         # TODO data augmentation, fuzz the target and compute cosine similarity
@@ -150,7 +174,7 @@ class DecisionTransformer(pl.LightningModule):
         # we have no loss for the target CLIP embedding since we never want
         # to learn it
 
-        loss = 2 * cos_sim_loss + patches_loss  # mess with the scaling constant?
+        loss = 4 * cos_sim_loss + patches_loss  # mess with the scaling constant?
         assert not loss.isnan().item()
         self.log("train/loss", loss)
         return loss
