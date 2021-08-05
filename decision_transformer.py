@@ -122,7 +122,7 @@ class DecisionTransformer(pl.LightningModule):
             clip_embeddings
             + torch.distributions.normal.Normal(
                 torch.zeros(
-                    [batch_size, clip_model.visual.output_dim], device=self.device
+                    [batch_size, self.clip_model.visual.output_dim], device=self.device
                 ),
                 torch.tensor([1], device=self.device),
             ).sample()
@@ -142,8 +142,6 @@ class DecisionTransformer(pl.LightningModule):
         )
 
         vqgan_tokenses = vqgan_tokenses.reshape(batch_size, -1)
-        # TODO data augmentation, fuzz the target and compute cosine similarity
-        # to fuzzed target
         targets_e = self.clip_embedding_linear(clip_embeddings)
         cos_sims_e = self.clip_similarity_linear(cos_sims)
         tokenses_e = self.vqgan_embedding(vqgan_tokenses)
@@ -191,26 +189,21 @@ class DecisionTransformer(pl.LightningModule):
             toks = self.positional.unsqueeze(0)
             toks[0][0] = target_e + toks[0][0]
 
-            # print(f"toks {toks}")
-
             cos_sim_candidates = []
             for _ in range(100):  # How many samples do we need? 100 is asspulled
                 encoded = self.encoder(toks, mask=self.attn_mask)[0, 0]
                 pred_cos_sim = self.decoder_cos_sim(encoded)
                 cos_sim_candidates.append(pred_cos_sim)
             cos_sim_candidates, _idxs = torch.cat(cos_sim_candidates).sort()
-            # print(f"cos_sim_candidates {cos_sim_candidates}")
 
             # 90th percentile is asspulled too
             cos_sim_target = cos_sim_candidates[int(len(cos_sim_candidates) * 0.90)]
-            # print(f"cos_sim_target {cos_sim_target}")
 
             toks[0, 1] = toks[0, 1] + self.decoder_cos_sim(cos_sim_target.unsqueeze(0))
 
             vqgan_toks = []
 
             for i in range(self.vqgan_tokens):
-                # print(f"toks {toks}")
 
                 # Could do top-p sampling here, or one of the other ones. Doing
                 # the simplest approach for now.
@@ -220,20 +213,16 @@ class DecisionTransformer(pl.LightningModule):
                 )
                 vqgan_token_probabilities = vqgan_token_probabilities.softmax(1)
                 sampled_toks = vqgan_token_probabilities.multinomial(1)
-                # print(f"sampled_toks {sampled_toks}")
                 toks[0, i + 2] = self.vqgan_embedding(sampled_toks[0, 0])
                 vqgan_toks.append(sampled_toks[0, 0])
 
             img_res_in_tokens = int(math.sqrt(self.vqgan_tokens))
 
             vqgan_toks = torch.stack(vqgan_toks)
-            print(f"vqgan_toks {vqgan_toks}")
             z = self.vqgan_model.quantize.embed(vqgan_toks)
-            print(f"z {z} {z.shape}")
             z = z.reshape((1, img_res_in_tokens, img_res_in_tokens, -1))
             z = z.transpose(1, 3)
             z = z.transpose(2, 3)
-            print(f"z {z.shape}")
             return ((self.vqgan_model.decode(z)[0] + 1) / 2).clamp(0, 1)
 
     def setup_positional_encoding(self):
