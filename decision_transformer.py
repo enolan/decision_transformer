@@ -97,7 +97,7 @@ class DecisionTransformer(pl.LightningModule):
             reconstructed_imgs = self.vqgan_model.decode(vqgan_zs)
 
         # Stick a reconstructed example in TensorBoard for debug purposes
-        if random.random() <= 0.05:
+        if random.random() <= 0.01:
             idx = random.randint(0, batch_size - 1)
             self.logger.experiment.add_image(
                 f"original/{self.logged_reconstructions}", imgs_tensor[idx]
