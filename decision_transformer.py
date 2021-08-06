@@ -279,23 +279,25 @@ class TrainLossRecorder(pl.Callback):
         self.train_loss = outputs["loss"].item()
 
 
-class EvalEveryEpoch(pl.Callback):
-    def __init__(self, prompts, model):
+class EvalEveryNIts(pl.Callback):
+    def __init__(self, prompts, model, n):
+        self.n = n
         self.prompts = []
-
         with torch.no_grad():
             for prompt in prompts:
                 tokens = clip.tokenize([prompt]).cuda()
                 embedding = model.clip_model.encode_text(tokens).float()
                 self.prompts.append({"prompt": prompt, "embedding": embedding})
 
-        self.ctr = 0
-
-    def on_train_epoch_start(self, trainer, pl):
-        for prompt in self.prompts:
-            img = pl.forward(prompt["embedding"])
-            pl.logger.experiment.add_image(f"{prompt['prompt']}/{self.ctr}", img)
-        self.ctr = self.ctr + 1
+    def on_train_batch_start(
+        self, trainer, pl_module, batch, batch_idx, dataloader_idx
+    ):
+        if pl_module.global_step % self.n == 0:
+            for prompt in self.prompts:
+                img = pl_module.forward(prompt["embedding"])
+                pl_module.logger.experiment.add_image(
+                    f"{prompt['prompt']}", img, global_step=pl_module.global_step
+                )
 
 
 def setup_clip_and_vqgan(want_vqgan_weights=True):
@@ -378,8 +380,17 @@ if __name__ == "__main__":
     )
     dt_model = DecisionTransformer(64, 4, 4, clip_model, vqgan_model, output_res)
 
-    eval_callback = EvalEveryEpoch(
-        ["a sad man's face", "a group of women", "a man giving a speech"], dt_model
+    eval_callback = EvalEveryNIts(
+        ["a sad man's face",
+        "a group of women",
+        "a man giving a speech",
+        "a bouquet of roses",
+        "Manhattan at sunset #pentax67",
+        "a painting inspired by a 5-MeO-DMT trip",
+        "Burning Man 2018 #artcar #pentax67"
+        ],
+        dt_model,
+        2000
     )
 
     dl = DataLoader(
