@@ -26,9 +26,10 @@ for dir in [stills_out_dir, video_stills_out_dir]:
 
 provenance = []
 
+
 def process_dir(dir, depth):
     global outnum
-    paths = list(dir.iterdir()) # Make a list so we can get an ETA with tqdm
+    paths = list(dir.iterdir())  # Make a list so we can get an ETA with tqdm
     for p in tqdm(paths, position=depth, leave=depth == 0):
         if p.is_file():
             if p.suffix == ".jpg" or p.suffix == ".jpeg" or p.suffix == ".png":
@@ -43,10 +44,12 @@ def process_dir(dir, depth):
                     frame_to_save = random.randint(0, frames - 1)
                     gen = imageio_ffmpeg.read_frames(p)
                     metadata = gen.__next__()
-                    for n in range(frame_to_save - 1): # first output is metadata dict
+                    for n in range(frame_to_save - 1):  # first output is metadata dict
                         gen.__next__()
                     frame_buffer = gen.__next__()
-                    frame_pil = Image.frombytes(mode="RGB", size=metadata["source_size"], data=frame_buffer)
+                    frame_pil = Image.frombytes(
+                        mode="RGB", size=metadata["source_size"], data=frame_buffer
+                    )
                     target = (video_stills_out_dir / str(outnum)).with_suffix(".jpg")
                     frame_pil.save(target, quality=90)
                     provenance.append((p, target))
@@ -63,6 +66,9 @@ def process_dir(dir, depth):
 
 process_dir(top_dir, 0)
 
-with open(top_dir.parent / f"{top_dir.name}_provenance", mode="w", ) as f:
+with open(
+    top_dir.parent / f"{top_dir.name}_provenance",
+    mode="w",
+) as f:
     for source, target in provenance:
         f.write(f"{source} -> {target}\n")
