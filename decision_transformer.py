@@ -362,16 +362,6 @@ def transform_image(img, target_res, clip_model, clip_preprocessor, vqgan_model)
     )
     return torchvision.transforms.functional.to_tensor(transform(img))
 
-
-def clean_img_dir(dir):
-    for path in os.listdir(dir):
-        try:
-            PIL.Image.open(f"{dir}/{path}").copy()
-        except (PIL.UnidentifiedImageError, OSError):
-            print(f"Deleting {path}")
-            os.remove(f"{dir}/{path}")
-
-
 if __name__ == "__main__":
 
     output_res = 256
