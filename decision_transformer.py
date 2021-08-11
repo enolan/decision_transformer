@@ -175,13 +175,17 @@ class DecisionTransformer(pl.LightningModule):
         cos_sim_loss = F.mse_loss(cos_sim_pred, cos_sims)
         self.log("train/cos_sim_loss", cos_sim_loss)
 
-        vqgan_probs = self.decoder_vqgan_tokens(encoded)[
-            :, 1:-1
-        ]  # logged and unnormalized probabilities
-        patches_loss = F.cross_entropy(
-            vqgan_probs.reshape(-1, self.vqgan_model.quantize.n_embed),
-            vqgan_tokenses.reshape(-1),
+        vqgan_probs = self.decoder_vqgan_tokens(encoded)[:, 1:-1]  # inputs to softmax
+        patch_losses = []
+        for i in range(vqgan_probs.shape[1]):
+            patch_losses.append(
+                F.cross_entropy(vqgan_probs[:, i, :], vqgan_tokenses[:, i]).unsqueeze(0)
+            )
+        patch_losses = torch.cat(patch_losses)
+        self.logger.experiment.add_histogram(
+            "train/patch_losses", patch_losses, global_step=self.global_step
         )
+        patches_loss = patch_losses.mean()
         self.log("train/patches_loss", patches_loss)
 
         # we have no loss for the target CLIP embedding since we never want
