@@ -2,6 +2,7 @@ import clip
 import math
 from omegaconf import OmegaConf
 import os
+from pathlib import Path
 import PIL
 import pytorch_lightning as pl
 import random
@@ -362,6 +363,24 @@ def transform_image(img, target_res, clip_model, clip_preprocessor, vqgan_model)
     )
     return torchvision.transforms.functional.to_tensor(transform(img))
 
+
+class FilteredImageFolder(torchvision.datasets.ImageFolder):
+    def find_classes(self, directory):
+        dirs, _mapping = super().find_classes(directory)
+        out_dirs = []
+        for dir in dirs:
+            contents_iter = (Path(directory) / dir).iterdir()
+            if any(True for _ in contents_iter):
+                # ^ Weird Python method of checking if it has > 0 elements
+                out_dirs.append(dir)
+        out_mapping = {}
+        next_idx = 0
+        for out_dir in out_dirs:
+            out_mapping[out_dir] = next_idx
+            next_idx = next_idx + 1
+        return out_dirs, out_mapping
+
+
 if __name__ == "__main__":
 
     output_res = 256
@@ -384,12 +403,11 @@ if __name__ == "__main__":
     )
 
     dl = DataLoader(
-        torchvision.datasets.ImageFolder(
-            "/run/user/1000/learndata",
+        FilteredImageFolder(
+            "/home/enolan/mystuff/code/clip-gen/debug_test_data/4 colors",
             transform=lambda img: transform_image(
                 img, output_res, clip_model, clip_preprocessor, vqgan_model
             ),
-            is_valid_file=lambda p: p.endswith("bmp"),
         ),
         pin_memory=True,
         batch_size=8,
