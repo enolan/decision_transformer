@@ -143,7 +143,7 @@ class DecisionTransformer(pl.LightningModule):
         ).unsqueeze(1)
 
         self.logger.experiment.add_histogram(
-            "train/cosine_similarities", cos_sims[:, 0], global_step=self.global_step
+            "train/cos_sim_in", cos_sims[:, 0], global_step=self.global_step
         )
 
         vqgan_tokenses = vqgan_tokenses.reshape(batch_size, -1)
@@ -155,6 +155,13 @@ class DecisionTransformer(pl.LightningModule):
             [targets_e.unsqueeze(1), cos_sims_e.unsqueeze(1), tokenses_e], axis=1
         )
 
+        for tok_idx in range(0, self.vqgan_tokens + 2, (self.vqgan_tokens + 2) // 8):
+            self.logger.experiment.add_histogram(
+                f"position {tok_idx} positional channels",
+                self.positional[tok_idx, :],
+                global_step=self.global_step,
+            )
+
         inputs = inputs + self.positional
 
         encoded = self.encoder(inputs, mask=self.attn_mask)
@@ -162,6 +169,9 @@ class DecisionTransformer(pl.LightningModule):
         # all predictions are offset by 1. I.e. output n is a prediction for
         # token n + 1
         cos_sim_pred = self.decoder_cos_sim(encoded)[:, 0]
+        self.logger.experiment.add_histogram(
+            "train/cos_sim_pred", cos_sim_pred, global_step=self.global_step
+        )
         cos_sim_loss = F.mse_loss(cos_sim_pred, cos_sims)
         self.log("train/cos_sim_loss", cos_sim_loss)
 
