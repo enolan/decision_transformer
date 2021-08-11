@@ -89,6 +89,7 @@ class DecisionTransformer(pl.LightningModule):
 
         # Encode with VQGAN - does not play well with mixed precision
         with torch.cuda.amp.autocast(False):
+            self.vqgan_model.eval()
             vqgan_zs, _embedding_loss, [_, _, vqgan_tokenses] = self.vqgan_model.encode(
                 imgs_tensor * 2 - 1
             )
@@ -311,6 +312,7 @@ def setup_clip_and_vqgan(want_vqgan_weights=True):
         vqgan_model.init_from_ckpt("models/vqgan_gumbel_openimages_f8_8192.ckpt")
     del vqgan_model.loss
     vqgan_model.eval().requires_grad_(False)
+    vqgan_model.quantize.temperature = 1e-10
 
     return clip_model, clip_preprocessor, vqgan_model
 
