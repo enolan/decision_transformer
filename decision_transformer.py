@@ -40,7 +40,6 @@ class DecisionTransformer(pl.LightningModule):
         self.vqgan_model = vqgan_model
         self.clip_model = clip_model
         self.d_model = d_model
-        self.logged_reconstructions = 0
 
         # A linear layer embedding CLIP embeddings into our space.
         self.clip_embedding_linear = torch.nn.Linear(
@@ -101,13 +100,13 @@ class DecisionTransformer(pl.LightningModule):
         if random.random() <= 0.01:
             idx = random.randint(0, batch_size - 1)
             self.logger.experiment.add_image(
-                f"original/{self.logged_reconstructions}", imgs_tensor[idx]
+                f"sampled_original_img", imgs_tensor[idx], global_step=self.global_step
             )
             self.logger.experiment.add_image(
-                f"reconstructed/{self.logged_reconstructions}",
+                f"sampled_reconstructed_img",
                 ((reconstructed_imgs[idx] + 1) / 2).clamp(0, 1),
+                global_step=self.global_step,
             )
-            self.logged_reconstructions = self.logged_reconstructions + 1
 
         # Process with CLIP
         reconstructed_for_clip = self.normalize_for_clip(reconstructed_imgs)
