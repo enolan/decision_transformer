@@ -235,23 +235,12 @@ class DecisionTransformer(pl.LightningModule):
         # Two extra tokens for the target CLIP embedding and the cosine
         # similarity, treated specially.
 
-        self.register_buffer(
-            "positional",
-            torch.zeros(self.d_model).repeat(self.vqgan_tokens + 2, 1),
-            persistent=False,
+        positional = torch.nn.parameter.Parameter(
+            torch.normal(
+                torch.zeros(self.vqgan_tokens + 2, self.d_model), torch.tensor(1)
+            )
         )
-        self.positional[0][0] = 1.0
-        self.positional[1][1] = 1.0
-
-        token_idxs = torch.arange(self.vqgan_tokens).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, self.d_model - 2, 2)
-            * (-math.log(10000.0) / (self.d_model - 2))
-        )
-        pos_e = torch.zeros(self.vqgan_tokens, self.d_model - 2)
-        pos_e[:, 0::2] = torch.sin(token_idxs * div_term)
-        pos_e[:, 1::2] = torch.cos(token_idxs * div_term)
-        self.positional[2:, 2:] = pos_e
+        self.register_parameter("positional", positional)
 
     def setup_attention_mask(self):
         self.register_buffer(
