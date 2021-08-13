@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from positional_encoding import positional_encoding
+from clip_gen.positional_encoding import positional_encoding
 
 
 class NystromformerLM(pl.LightningModule):

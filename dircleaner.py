@@ -3,6 +3,7 @@
 from pathlib import Path
 import sys
 
+
 def clean_img_dir(dir):
     for path in os.listdir(dir):
         try:
@@ -10,6 +11,7 @@ def clean_img_dir(dir):
         except (PIL.UnidentifiedImageError, OSError):
             print(f"Deleting {path}")
             os.remove(f"{dir}/{path}")
+
 
 for dir in sys.argv[1:]:
     dir = Path(dir)

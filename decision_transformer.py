@@ -17,6 +17,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 import torchvision
 
+from clip_gen.utils import CheckGradients, FilteredImageFolder, TrainLossRecorder
+
 
 class DecisionTransformer(pl.LightningModule):
     """Main modified decision transformer model.
@@ -37,7 +39,13 @@ class DecisionTransformer(pl.LightningModule):
     """
 
     def __init__(
-        self, d_model, n_head, n_layers, clip_model, vqgan_model, output_resolution
+        self,
+        d_model,
+        n_head,
+        n_layers,
+        clip_model,
+        vqgan_model,
+        output_resolution,
     ):
         super().__init__()
 
@@ -47,10 +55,10 @@ class DecisionTransformer(pl.LightningModule):
 
         # A linear layer embedding CLIP embeddings into our space.
         self.clip_embedding_linear = torch.nn.Linear(
-            clip_model.visual.output_dim, d_model
+            clip_model.visual.output_dim, d_model, bias=False
         )
         # A linear layer embedding CLIP similarities
-        self.clip_similarity_linear = torch.nn.Linear(1, d_model)
+        self.clip_similarity_linear = torch.nn.Linear(1, d_model, bias=False)
         # Embedding for VQGAN tokens
         self.vqgan_embedding = torch.nn.Embedding(vqgan_model.quantize.n_embed, d_model)
 
@@ -78,12 +86,12 @@ class DecisionTransformer(pl.LightningModule):
         )
 
         transformer_encoder_layer = torch.nn.TransformerEncoderLayer(
-            d_model, n_head, batch_first=True
+            d_model, n_head, batch_first=True, activation="gelu"
         )
         self.encoder = torch.nn.TransformerEncoder(transformer_encoder_layer, n_layers)
 
         self.decoder_vqgan_tokens = torch.nn.Linear(
-            d_model, vqgan_model.quantize.n_embed
+            d_model, vqgan_model.quantize.n_embed, bias=False
         )
         self.decoder_cos_sim = torch.nn.Linear(d_model, 1)
 
@@ -91,27 +99,7 @@ class DecisionTransformer(pl.LightningModule):
         imgs_tensor, _ = batch
         batch_size = imgs_tensor.shape[0]
 
-        # Encode with VQGAN - does not play well with mixed precision
-        with torch.cuda.amp.autocast(False):
-            self.vqgan_model.eval()
-            vqgan_zs, _embedding_loss, [_, _, vqgan_tokenses] = self.vqgan_model.encode(
-                imgs_tensor * 2 - 1
-            )
-            assert not vqgan_zs.isnan().any().item()
-
-            reconstructed_imgs = self.vqgan_model.decode(vqgan_zs)
-
-        # Stick a reconstructed example in TensorBoard for debug purposes
-        if random.random() <= 0.01:
-            idx = random.randint(0, batch_size - 1)
-            self.logger.experiment.add_image(
-                f"sampled_original_img", imgs_tensor[idx], global_step=self.global_step
-            )
-            self.logger.experiment.add_image(
-                f"sampled_reconstructed_img",
-                ((reconstructed_imgs[idx] + 1) / 2).clamp(0, 1),
-                global_step=self.global_step,
-            )
+        vqgan_tokenses, reconstructed_imgs = self._encode_with_vqgan(imgs_tensor)
 
         # Process with CLIP
         reconstructed_for_clip = self.normalize_for_clip(reconstructed_imgs)
@@ -129,7 +117,7 @@ class DecisionTransformer(pl.LightningModule):
                 torch.zeros(
                     [batch_size, self.clip_model.visual.output_dim], device=self.device
                 ),
-                torch.tensor([1], device=self.device),
+                torch.tensor([0.2], device=self.device),
             ).sample()
         )
         clip_fuzzed_targets = clip_fuzzed_targets / torch.linalg.vector_norm(
@@ -139,7 +127,7 @@ class DecisionTransformer(pl.LightningModule):
         clip_fuzzed_targets = clip_fuzzed_targets[torch.randperm(batch_size)]
 
         cos_sims = torch.nn.functional.cosine_similarity(
-            clip_embeddings, clip_fuzzed_targets
+            clip_embeddings, clip_embeddings  # clip_fuzzed_targets
         ).unsqueeze(1)
 
         self.logger.experiment.add_histogram(
@@ -155,7 +143,8 @@ class DecisionTransformer(pl.LightningModule):
             [targets_e.unsqueeze(1), cos_sims_e.unsqueeze(1), tokenses_e], axis=1
         )
 
-        for tok_idx in range(0, self.vqgan_tokens + 2, (self.vqgan_tokens + 2) // 8):
+        # for tok_idx in range(0, self.vqgan_tokens + 2, (self.vqgan_tokens + 2) // 8):
+        for tok_idx in range(0, self.vqgan_tokens + 2):
             self.logger.experiment.add_histogram(
                 f"position {tok_idx} positional channels",
                 self.positional[tok_idx, :],
@@ -175,74 +164,128 @@ class DecisionTransformer(pl.LightningModule):
         cos_sim_loss = F.mse_loss(cos_sim_pred, cos_sims)
         self.log("train/cos_sim_loss", cos_sim_loss)
 
-        vqgan_probs = self.decoder_vqgan_tokens(encoded)[:, 1:-1]  # inputs to softmax
-        patch_losses = []
-        for i in range(vqgan_probs.shape[1]):
-            patch_losses.append(
-                F.cross_entropy(vqgan_probs[:, i, :], vqgan_tokenses[:, i]).unsqueeze(0)
-            )
-        patch_losses = torch.cat(patch_losses)
-        self.logger.experiment.add_histogram(
-            "train/patch_losses", patch_losses, global_step=self.global_step
-        )
-        patches_loss = patch_losses.mean()
-        self.log("train/patches_loss", patches_loss)
+        patches_loss = self._compute_vqgan_loss(encoded)
 
         # we have no loss for the target CLIP embedding since we never want
         # to learn it
 
-        loss = 4 * cos_sim_loss + patches_loss  # mess with the scaling constant?
+        loss = patches_loss  # cos_sim_loss + patches_loss  # mess with the scaling constant?
         assert not loss.isnan().item()
         self.log("train/loss", loss)
         return loss
 
-    def forward(self, target_clip_embedding):
-        with torch.no_grad():
-            # Enable dropout for MC sampling
-            for m in self.modules():
-                if m.__class__.__name__.startswith("Dropout"):
-                    m.train()
+    def _encode_with_vqgan(self, imgs):
+        """Encode a tensor of images (in range (0, 1)) with the VQGAN,
+        returning both the VQGAN tokens and the reconstructed image (this time
+        in range (-1, 1)).
+        SHAPES:
+        - imgs (batch, channels, height, width)
+        - returned vqgan tokens (batch, height, width)
+        - returned imgs (batch, channels, height, width)
+        """
+        # VQGAN does not play well with mixed precision :(
+        with torch.cuda.amp.autocast(False):
+            self.vqgan_model.eval()
+            vqgan_zs, _embedding_loss, [_, _, vqgan_tokens] = self.vqgan_model.encode(
+                imgs * 2 - 1
+            )
+            assert not vqgan_zs.isnan().any().item()
 
-            target_e = self.clip_embedding_linear(target_clip_embedding)
+            reconstructed_imgs = self.vqgan_model.decode(vqgan_zs)
 
-            toks = self.positional.unsqueeze(0)
-            toks[0][0] = target_e + toks[0][0]
+        # Stick a reconstructed example in TensorBoard for debug purposes
+        if random.random() <= 0.01:
+            idx = random.randint(0, imgs.shape[0] - 1)
+            self.logger.experiment.add_image(
+                f"sampled_original_img", imgs[idx], global_step=self.global_step
+            )
+            self.logger.experiment.add_image(
+                f"sampled_reconstructed_img",
+                ((reconstructed_imgs[idx] + 1) / 2).clamp(0, 1),
+                global_step=self.global_step,
+            )
+        return vqgan_tokens, reconstructed_imgs
 
-            cos_sim_candidates = []
-            for _ in range(100):  # How many samples do we need? 100 is asspulled
-                encoded = self.encoder(toks, mask=self.attn_mask)[0, 0]
-                pred_cos_sim = self.decoder_cos_sim(encoded)
-                cos_sim_candidates.append(pred_cos_sim)
-            cos_sim_candidates, _idxs = torch.cat(cos_sim_candidates).sort()
+    def _compute_vqgan_loss(self, encoder_output, target_vqgan_tokens):
+        """Compute the loss for VQGAN tokens. encoder_output should come from
+        the transformer encoder, target_vqgan_tokens from the examples we're
+        training on.
+        SHAPES:
+        - encoder_output (batch, token, d_model)
+        - target_vqgan_tokens (batch, vqgan token) - tokens should be ints
+        """
 
-            # 90th percentile is asspulled too
-            cos_sim_target = cos_sim_candidates[int(len(cos_sim_candidates) * 0.90)]
+        vqgan_probs = self.decoder_vqgan_tokens(encoder_output)[:, 1:-1]
+        patch_losses = []
 
-            toks[0, 1] = toks[0, 1] + self.decoder_cos_sim(cos_sim_target.unsqueeze(0))
+        for i in range(vqgan_probs.shape[1]):
+            patch_losses.append(
+                F.cross_entropy(
+                    vqgan_probs[:, i, :], target_vqgan_tokens[:, i]
+                ).unsqueeze(0)
+            )
+        patch_losses = torch.cat(patch_losses)
 
-            vqgan_toks = []
+        self.logger.experiment.add_histogram(
+            "train/patch_losses", patch_losses, global_step=self.global_step
+        )
 
-            for i in range(self.vqgan_tokens):
+        patches_loss = patch_losses.mean()
+        self.log("train/patches_loss", patches_loss)
 
-                # Could do top-p sampling here, or one of the other ones. Doing
-                # the simplest approach for now.
-                encoded = self.encoder(toks, mask=self.attn_mask)[0, i + 1]
-                vqgan_token_probabilities = self.decoder_vqgan_tokens(
-                    encoded.unsqueeze(0)
-                )
-                vqgan_token_probabilities = vqgan_token_probabilities.softmax(1)
-                sampled_toks = vqgan_token_probabilities.multinomial(1)
-                toks[0, i + 2] = self.vqgan_embedding(sampled_toks[0, 0])
-                vqgan_toks.append(sampled_toks[0, 0])
+        return patches_loss
 
-            img_res_in_tokens = int(math.sqrt(self.vqgan_tokens))
+    def forward(self, target_clip_embedding, text=None):
+        # Enable dropout for MC sampling
+        for m in self.modules():
+            if m.__class__.__name__.startswith("Dropout"):
+                m.train()
 
-            vqgan_toks = torch.stack(vqgan_toks)
-            z = self.vqgan_model.quantize.embed(vqgan_toks)
-            z = z.reshape((1, img_res_in_tokens, img_res_in_tokens, -1))
-            z = z.transpose(1, 3)
-            z = z.transpose(2, 3)
-            return ((self.vqgan_model.decode(z)[0] + 1) / 2).clamp(0, 1)
+        target_e = self.clip_embedding_linear(target_clip_embedding)
+
+        toks = torch.clone(self.positional).unsqueeze(0)
+        toks[0][0] = target_e + toks[0][0]
+
+        cos_sim_candidates = []
+        for _ in range(100):  # How many samples do we need? 100 is asspulled
+            encoded = self.encoder(toks, mask=self.attn_mask)[0, 0]
+            pred_cos_sim = self.decoder_cos_sim(encoded).clamp(0, 1)
+            cos_sim_candidates.append(pred_cos_sim)
+        cos_sim_candidates, _idxs = torch.cat(cos_sim_candidates).sort()
+
+        # 90th percentile is asspulled too
+        cos_sim_target = cos_sim_candidates[int(len(cos_sim_candidates) * 0.90)]
+
+        encoded_cos_sim = self.clip_similarity_linear(cos_sim_target.unsqueeze(0))
+        toks[0, 1] = toks[0, 1] + encoded_cos_sim
+
+        vqgan_toks = self._sample_img(toks)
+
+        return self._vqgan_toks_to_image(vqgan_toks)
+
+    def _sample_img(self, toks):
+        """Sample an image given a vector of input tokens with everything
+        before the VQGAN tokens filled in. Mutates toks.
+        SHAPES:
+        toks - (1, vqgan_tokens + 2, d_model)
+        return - (vqgan_tokens)
+        """
+
+        vqgan_toks = []
+
+        for i in range(self.vqgan_tokens):
+            # Could do top-p sampling here, or one of the other ones. Doing the
+            # simplest approach for now.
+            encoded = self.encoder(toks, mask=self.attn_mask)[0, i + 1]
+            vqgan_token_probabilities = self.decoder_vqgan_tokens(encoded.unsqueeze(0))[
+                0
+            ]
+            vqgan_token_probabilities = vqgan_token_probabilities.softmax(0)
+            sampled_tok = vqgan_token_probabilities.multinomial(1)[0]
+            toks[0, i + 2] = self.vqgan_embedding(sampled_tok)
+            vqgan_toks.append(sampled_tok)
+
+        return torch.stack(vqgan_toks)
 
     def setup_positional_encoding(self):
         # Output tensor is (vqgan_tokens + 2, d_model)
@@ -250,8 +293,8 @@ class DecisionTransformer(pl.LightningModule):
         # similarity, treated specially.
 
         positional = torch.nn.parameter.Parameter(
-            torch.normal(
-                torch.zeros(self.vqgan_tokens + 2, self.d_model), torch.tensor(1)
+            torch.distributions.uniform.Uniform(-1.0, 1.0).rsample(
+                (self.vqgan_tokens + 2, self.d_model)
             )
         )
         self.register_parameter("positional", positional)
@@ -262,11 +305,7 @@ class DecisionTransformer(pl.LightningModule):
             torch.triu(
                 torch.ones(self.vqgan_tokens + 2, self.vqgan_tokens + 2)
                 * float("-inf"),
-                diagonal=1
-                # this seems wrong? but it makes everything NaN otherwise. It
-                # means the first token output is allowed to attend to itself.
-                # Which shouldn't matter in this application but is still
-                # wrong.
+                diagonal=1,
             ),
             persistent=False,
         )
@@ -274,17 +313,87 @@ class DecisionTransformer(pl.LightningModule):
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters())
 
+    def _vqgan_toks_to_image(self, vqgan_toks):
+        """Given a tensor of VQGAN tokens, return an image with shape
+        (channels, height, width) suitable for sending to Tensorboard.
+        """
+        img_res_in_tokens = int(math.sqrt(self.vqgan_tokens))
 
-class TrainLossRecorder(pl.Callback):
-    "Tool for recording the training loss."
+        z = self.vqgan_model.quantize.embed(vqgan_toks)
+        z = z.reshape((1, img_res_in_tokens, img_res_in_tokens, -1))
+        z = z.transpose(1, 3)
+        z = z.transpose(2, 3)
+        img = ((self.vqgan_model.decode(z)[0] + 1) / 2).clamp(0, 1)
+        return img
 
-    def __init__(self):
-        self.train_loss = None
 
-    def on_train_batch_end(
-        self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx
-    ):
-        self.train_loss = outputs["loss"].item()
+def test_can_init_dt():
+    "Check setting up a DT module works"
+    clip_model, _clip_preprocessor, vqgan_model = setup_clip_and_vqgan(
+        want_vqgan_weights=False
+    )
+    DecisionTransformer(16, 4, 4, clip_model, vqgan_model, 64)
+
+
+class NoInputModel(DecisionTransformer):
+    """Class to test model with 0 inputs. It should be able to memorize an image
+    that is all one color, but not track different positions differently or
+    memorize multiple images."""
+
+    def training_step(self, batch, batch_idx):
+        imgs, _ = batch
+        batch_size = imgs.shape[0]
+
+        vqgan_tokens, _ = self._encode_with_vqgan(imgs)
+        vqgan_tokens = vqgan_tokens.reshape(batch_size, -1)
+
+        inputs = torch.zeros(
+            batch_size, self.vqgan_tokens + 2, self.d_model, device=self.device
+        )
+
+        encoded = self.encoder(inputs, mask=self.attn_mask)
+
+        patches_loss = self._compute_vqgan_loss(encoded, vqgan_tokens)
+
+        return patches_loss
+
+    def forward(self, _target_clip_embedding, text=None):
+        inputs = torch.zeros(1, self.vqgan_tokens + 2, self.d_model, device=self.device)
+
+        vqgan_tokens = self._sample_img(inputs)
+
+        return self._vqgan_toks_to_image(vqgan_tokens.unsqueeze(0))
+
+
+def test_no_input():
+    clip_model, _clip_preprocessor, vqgan_model = setup_clip_and_vqgan(
+        want_vqgan_weights=True
+    )
+
+    model_res = 64
+    model = NoInputModel(32, 4, 4, clip_model, vqgan_model, model_res)
+
+    dl = DataLoader(
+        torchvision.datasets.ImageFolder(
+            "debug_test_data/all-white",
+            transform=lambda img: transform_image(img, model_res),
+        ),
+        pin_memory=True,
+        batch_size=64,  # TODO test at real batch size
+        num_workers=8,
+    )
+
+    eval_callback = EvalEveryNIts(["a white square"], model, 100)
+    loss_recorder = TrainLossRecorder()
+    trainer = pl.Trainer(
+        gpus=1,
+        log_every_n_steps=1,
+        max_steps=150,
+        precision=16,
+        callbacks=[eval_callback, loss_recorder, CheckGradients(generate_charts=False)],
+    )
+    trainer.fit(model, dl)
+    assert loss_recorder.train_loss < 3.8
 
 
 class EvalEveryNIts(pl.Callback):
@@ -301,53 +410,14 @@ class EvalEveryNIts(pl.Callback):
         self, trainer, pl_module, batch, batch_idx, dataloader_idx
     ):
         if pl_module.global_step % self.n == 0:
-            for prompt in self.prompts:
-                img = pl_module.forward(prompt["embedding"])
-                pl_module.logger.experiment.add_image(
-                    f"{prompt['prompt']}", img, global_step=pl_module.global_step
-                )
-
-
-class CheckGradients(pl.Callback):
-    def on_after_backward(self, trainer, pl_module):
-        plot_grad_flow(pl_module.named_parameters())
-        plt.savefig(f"grads-{pl_module.global_step}.svg")
-        plt.clf()
-
-
-# Debugging function from https://discuss.pytorch.org/t/check-gradient-flow-in-network/15063/10
-def plot_grad_flow(named_parameters):
-    """Plots the gradients flowing through different layers in the net during training.
-    Can be used for checking for possible gradient vanishing / exploding problems.
-
-    Usage: Plug this function in Trainer class after loss.backwards() as
-    "plot_grad_flow(self.model.named_parameters())" to visualize the gradient flow"""
-    ave_grads = []
-    max_grads = []
-    layers = []
-    for n, p in named_parameters:
-        if (p.requires_grad) and ("bias" not in n) and (p.grad is not None):
-            layers.append(n)
-            ave_grads.append(p.grad.abs().mean().cpu())
-            max_grads.append(p.grad.abs().max().cpu())
-    plt.bar(np.arange(len(max_grads)), max_grads, alpha=0.1, lw=1, color="c")
-    plt.bar(np.arange(len(max_grads)), ave_grads, alpha=0.1, lw=1, color="b")
-    plt.hlines(0, 0, len(ave_grads) + 1, lw=2, color="k")
-    plt.xticks(range(0, len(ave_grads), 1), layers, rotation="vertical")
-    plt.xlim(left=0, right=len(ave_grads))
-    plt.ylim(bottom=-0.001, top=0.02)  # zoom in on the lower gradient regions
-    plt.xlabel("Layers")
-    plt.ylabel("average gradient")
-    plt.title("Gradient flow")
-    plt.grid(True)
-    plt.legend(
-        [
-            Line2D([0], [0], color="c", lw=4),
-            Line2D([0], [0], color="b", lw=4),
-            Line2D([0], [0], color="k", lw=4),
-        ],
-        ["max-gradient", "mean-gradient", "zero-gradient"],
-    )
+            with torch.no_grad():
+                pl_module.eval()
+                for prompt in self.prompts:
+                    img = pl_module(prompt["embedding"], text=prompt["prompt"])
+                    pl_module.logger.experiment.add_image(
+                        f"{prompt['prompt']}", img, global_step=pl_module.global_step
+                    )
+                pl_module.train()
 
 
 def setup_clip_and_vqgan(want_vqgan_weights=True):
@@ -366,90 +436,44 @@ def setup_clip_and_vqgan(want_vqgan_weights=True):
     return clip_model, clip_preprocessor, vqgan_model
 
 
-def test_can_init_dt():
-    "Check setting up a DT module works"
-    clip_model, _clip_preprocessor, vqgan_model = setup_clip_and_vqgan(
-        want_vqgan_weights=False
-    )
-    DecisionTransformer(16, 4, 4, clip_model, vqgan_model, 64)
-
-
-def test_dummy_train():
-    "Check we can memorize a trivial dataset."
-    clip_model, _clip_preprocessor, vqgan_model = setup_clip_and_vqgan(
-        want_vqgan_weights=False
-    )
-    dt_model = DecisionTransformer(16, 4, 4, clip_model, vqgan_model, 64)
-    dummy_clip_target = torch.zeros(clip_model.visual.output_dim)
-
-    copies = 4096
-
-    dummy_imgs = torch.zeros(copies, 3, 64, 64)
-    dummy_targets = torch.zeros(copies, 1)
-
-    dl = DataLoader(
-        TensorDataset(dummy_imgs, dummy_targets),
-        pin_memory=True,
-        batch_size=16,
-    )
-
-    loss_recorder = TrainLossRecorder()
-    trainer = pl.Trainer(gpus=1, max_epochs=35, callbacks=[loss_recorder])
-    trainer.fit(dt_model, dl)
-
-    assert loss_recorder.train_loss < 0.01
-
-
-def transform_image(img, target_res, clip_model, clip_preprocessor, vqgan_model):
+def transform_image(img, target_res):
     "Transform a PIL image into the appropriate tensors"
 
     # Fit to size
     smaller_dim = min(img.width, img.height)
     transform = torchvision.transforms.Compose(
         [
-            torchvision.transforms.RandomCrop(smaller_dim),
+            torchvision.transforms.CenterCrop(smaller_dim),
+            #            torchvision.transforms.RandomCrop(smaller_dim),
             torchvision.transforms.Resize((target_res, target_res)),
         ]
     )
     return torchvision.transforms.functional.to_tensor(transform(img))
 
 
-class FilteredImageFolder(torchvision.datasets.ImageFolder):
-    def find_classes(self, directory):
-        dirs, _mapping = super().find_classes(directory)
-        out_dirs = []
-        for dir in dirs:
-            contents_iter = (Path(directory) / dir).iterdir()
-            if any(True for _ in contents_iter):
-                # ^ Weird Python method of checking if it has > 0 elements
-                out_dirs.append(dir)
-        out_mapping = {}
-        next_idx = 0
-        for out_dir in out_dirs:
-            out_mapping[out_dir] = next_idx
-            next_idx = next_idx + 1
-        return out_dirs, out_mapping
-
-
 if __name__ == "__main__":
 
-    output_res = 256
+    matplotlib.use("svg")
+
+    output_res = 16
     clip_model, clip_preprocessor, vqgan_model = setup_clip_and_vqgan(
         want_vqgan_weights=True
     )
-    dt_model = DecisionTransformer(64, 4, 4, clip_model, vqgan_model, output_res)
+    dt_model = DecisionTransformer(64, 4, 8, clip_model, vqgan_model, output_res)
 
     eval_callback = EvalEveryNIts(
-        ["a sad man's face",
-        "a group of women",
-        "a man giving a speech",
-        "a bouquet of roses",
-        "Manhattan at sunset #pentax67",
-        "a painting inspired by a 5-MeO-DMT trip",
-        "Burning Man 2018 #artcar #pentax67"
+        [
+            "a smiling woman"
+            # "a sad man's face",
+            # "a group of women",
+            # "a man giving a speech",
+            # "a bouquet of roses",
+            # "Manhattan at sunset #pentax67",
+            # "a painting inspired by a 5-MeO-DMT trip",
+            # "Burning Man 2018 #artcar #pentax67",
         ],
         dt_model,
-        2000
+        500,
     )
 
     dl = DataLoader(
@@ -460,12 +484,15 @@ if __name__ == "__main__":
             ),
         ),
         pin_memory=True,
-        batch_size=8,
+        batch_size=1,
         num_workers=8,
-        shuffle=True,
+        # shuffle=True,
     )
 
     trainer = pl.Trainer(
-        gpus=1, log_every_n_steps=1, callbacks=[eval_callback], precision=16
+        gpus=1,
+        log_every_n_steps=1,
+        callbacks=[eval_callback, CheckGradients()],
+        precision=16,
     )
     trainer.fit(dt_model, dl)
