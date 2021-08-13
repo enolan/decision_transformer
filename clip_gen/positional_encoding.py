@@ -2,7 +2,7 @@ import math
 import torch
 
 
-def positional_encoding(d_model, n_tokens):
+def gen_positional_encoding(d_model, n_tokens):
     "Generate a positional encoding for a transformer"
     pos_e = torch.zeros(n_tokens, d_model)
     for pos in range(n_tokens):

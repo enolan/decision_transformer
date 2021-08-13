@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 import torchvision
 
+from clip_gen.positional_encoding import gen_positional_encoding
 from clip_gen.utils import CheckGradients, FilteredImageFolder, TrainLossRecorder
 
 
@@ -287,17 +288,28 @@ class DecisionTransformer(pl.LightningModule):
 
         return torch.stack(vqgan_toks)
 
+    def _sample_img_without_autoregression(self, toks):
+        """Same as _sample_img, but does not generate the image progressively
+        adding each output patch into the input as it works. Does not mutate
+        toks."""
+
+        encoded = self.encoder(toks, mask=self.attn_mask)
+
+        vqgan_token_probabilities = self.decoder_vqgan_tokens(encoded)[0, 1:-1]
+        vqgan_token_probabilities = vqgan_token_probabilities.softmax(1)
+        vqgan_tokens = torch.distributions.Categorical(
+            probs=vqgan_token_probabilities
+        ).sample()
+
+        return vqgan_tokens
+
     def setup_positional_encoding(self):
         # Output tensor is (vqgan_tokens + 2, d_model)
-        # Two extra tokens for the target CLIP embedding and the cosine
-        # similarity, treated specially.
-
-        positional = torch.nn.parameter.Parameter(
-            torch.distributions.uniform.Uniform(-1.0, 1.0).rsample(
-                (self.vqgan_tokens + 2, self.d_model)
-            )
+        # Originally I had special encodings for the CLIP target and similarity
+        # but I nixed them for simplicity. Probably doesn't matter.
+        self.register_buffer(
+            "positional", gen_positional_encoding(self.d_model, self.vqgan_tokens + 2)
         )
-        self.register_parameter("positional", positional)
 
     def setup_attention_mask(self):
         self.register_buffer(
@@ -360,13 +372,7 @@ class NoInputModel(DecisionTransformer):
     def forward(self, _target_clip_embedding, text=None):
         inputs = torch.zeros(1, self.vqgan_tokens + 2, self.d_model, device=self.device)
 
-        encoded = self.encoder(inputs, mask=self.attn_mask)
-
-        vqgan_token_probabilities = self.decoder_vqgan_tokens(encoded)[0, 1:-1]
-        vqgan_token_probabilities = vqgan_token_probabilities.softmax(1)
-        vqgan_tokens = torch.distributions.Categorical(
-            probs=vqgan_token_probabilities
-        ).sample()
+        vqgan_tokens = self._sample_img_without_autoregression(inputs)
 
         return self._vqgan_toks_to_image(vqgan_tokens)
 
@@ -400,6 +406,66 @@ def test_no_input():
     )
     trainer.fit(model, dl)
     assert loss_recorder.train_loss < 3.8
+
+
+class PositionalOnlyModel(DecisionTransformer):
+    """Class to test model with only the positional encoding. Should be able to
+    memorize a single image with arbitrary structure, but not multiple since it
+    doesn't know what else has been drawn. Interestingly it sort of appears to
+    if you give it a dataset with more than 1 item since the VQGAN encoding
+    involves local context.
+    """
+
+    def training_step(self, batch, batch_idx):
+        imgs, _ = batch
+        batch_size = imgs.shape[0]
+
+        vqgan_tokens, _ = self._encode_with_vqgan(imgs)
+        vqgan_tokens = vqgan_tokens = vqgan_tokens.reshape(batch_size, -1)
+
+        inputs = self.positional.expand(batch_size, self.vqgan_tokens + 2, self.d_model)
+
+        encoded = self.encoder(inputs, mask=self.attn_mask)
+
+        patches_loss = self._compute_vqgan_loss(encoded, vqgan_tokens)
+
+        return patches_loss
+
+    def forward(self, _target_clip_embedding, text=None):
+        inputs = self.positional.unsqueeze(0)
+        vqgan_tokens = self._sample_img_without_autoregression(inputs)
+        return self._vqgan_toks_to_image(vqgan_tokens)
+
+
+def test_positional_only():
+    clip_model, _clip_preprocessor, vqgan_model = setup_clip_and_vqgan(
+        want_vqgan_weights=True
+    )
+
+    model_res = 64
+    model = PositionalOnlyModel(32, 4, 4, clip_model, vqgan_model, model_res)
+
+    dl = DataLoader(
+        FilteredImageFolder(
+            "debug_test_data/4 colors",
+            transform=lambda img: transform_image(img, model_res),
+        ),
+        pin_memory=True,
+        batch_size=32,
+        num_workers=8,
+    )
+
+    eval_callback = EvalEveryNIts(["a four color square"], model, 100)
+    loss_recorder = TrainLossRecorder()
+    trainer = pl.Trainer(
+        gpus=1,
+        log_every_n_steps=1,
+        max_steps=400,
+        precision=16,
+        callbacks=[eval_callback, loss_recorder, CheckGradients(generate_charts=False)],
+    )
+    trainer.fit(model, dl)
+    assert loss_recorder.train_loss < 1.4
 
 
 class EvalEveryNIts(pl.Callback):
