@@ -360,9 +360,15 @@ class NoInputModel(DecisionTransformer):
     def forward(self, _target_clip_embedding, text=None):
         inputs = torch.zeros(1, self.vqgan_tokens + 2, self.d_model, device=self.device)
 
-        vqgan_tokens = self._sample_img(inputs)
+        encoded = self.encoder(inputs, mask=self.attn_mask)
 
-        return self._vqgan_toks_to_image(vqgan_tokens.unsqueeze(0))
+        vqgan_token_probabilities = self.decoder_vqgan_tokens(encoded)[0, 1:-1]
+        vqgan_token_probabilities = vqgan_token_probabilities.softmax(1)
+        vqgan_tokens = torch.distributions.Categorical(
+            probs=vqgan_token_probabilities
+        ).sample()
+
+        return self._vqgan_toks_to_image(vqgan_tokens)
 
 
 def test_no_input():
@@ -379,7 +385,7 @@ def test_no_input():
             transform=lambda img: transform_image(img, model_res),
         ),
         pin_memory=True,
-        batch_size=64,  # TODO test at real batch size
+        batch_size=64,
         num_workers=8,
     )
 
