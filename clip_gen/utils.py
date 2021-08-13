@@ -27,24 +27,37 @@ class CheckGradients(pl.Callback):
     """Callback to log gradient norm to Tensorboard and optionally generate an
     SVG chart broken down by each weight."""
 
-    def __init__(self, generate_charts=False):
+    def __init__(self, generate_charts=False, clip_at=None):
         super().__init__()
         self.generate_charts = generate_charts
+        self.clip_at = clip_at
 
     def on_before_optimizer_step(self, trainer, pl_module, optimizer, opt_idx):
-        params = []
-        for _n, param in pl_module.named_parameters():
-            if param.grad is not None:
-                params.append(param.grad.flatten())
-        # print(f"grad norm step {pl_module.global_step}: {torch.linalg.vector_norm(torch.cat(params))}")
-        if len(params) > 0:
-            pl_module.log(
-                "grad_norm", torch.linalg.vector_norm(torch.cat(params)), on_step=True
-            )
         if pl_module.global_step % 100 == 0 and self.generate_charts:
             plot_grad_flow(pl_module.named_parameters())
             plt.savefig(f"grads-{pl_module.global_step}.svg")
             plt.clf()
+
+        grad_norm, params = self._compute_grad_norm(pl_module.named_parameters())
+        if self.clip_at is not None and grad_norm > self.clip_at:
+            print(
+                f"Gradient norm {grad_norm} at step {pl_module.global_step}, clipping"
+            )
+            torch.nn.utils.clip_grad_norm_(params, max_norm=self.clip_at)
+            new_norm = self._compute_grad_norm(pl_module.named_parameters())[0]
+            print(f"New gradient norm is {new_norm}.")
+            pl_module.log("grad_norm", new_norm, on_step=True)
+        else:
+            pl_module.log("grad_norm", grad_norm, on_step=True)
+
+    def _compute_grad_norm(self, named_params):
+        grads = []
+        params = []
+        for _n, param in named_params:
+            if param.grad is not None:
+                grads.append(param.grad.view(-1))
+                params.append(param)
+        return torch.linalg.vector_norm(torch.cat(grads)), params
 
 
 # Debugging function from https://discuss.pytorch.org/t/check-gradient-flow-in-network/15063/10
