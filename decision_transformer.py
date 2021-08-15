@@ -615,11 +615,22 @@ if __name__ == "__main__":
 
     matplotlib.use("svg")
 
-    output_res = 16
+    output_res = 128
     clip_model, clip_preprocessor, vqgan_model = setup_clip_and_vqgan(
         want_vqgan_weights=True
     )
-    dt_model = DecisionTransformer(64, 4, 8, clip_model, vqgan_model, output_res)
+    # stole these hyperparameters from GPT-1, modulo the layer count which is
+    # 12 in their implementation
+
+    dt_model = PositionalAndAutoregressiveModel(
+        768,
+        12,
+        3072,
+        6,
+        clip_model,
+        vqgan_model,
+        output_res,
+    )
 
     eval_callback = EvalEveryNIts(
         [
@@ -633,26 +644,29 @@ if __name__ == "__main__":
             # "Burning Man 2018 #artcar #pentax67",
         ],
         dt_model,
-        500,
+        1000,
     )
 
     dl = DataLoader(
         FilteredImageFolder(
-            "/home/enolan/mystuff/code/clip-gen/debug_test_data/4 colors",
-            transform=lambda img: transform_image(
-                img, output_res, clip_model, clip_preprocessor, vqgan_model
-            ),
+            "/home/enolan/mystuff/code/clip-gen/debug_test_data/cats",
+            transform=lambda img: transform_image(img, output_res),
         ),
         pin_memory=True,
-        batch_size=1,
+        batch_size=16,
         num_workers=8,
-        # shuffle=True,
+        shuffle=True,
+        drop_last=True,
     )
 
     trainer = pl.Trainer(
         gpus=1,
         log_every_n_steps=1,
-        callbacks=[eval_callback, CheckGradients()],
+        callbacks=[
+            eval_callback,
+            CheckGradients(clip_percentile=0.95),
+        ],
         precision=16,
+        max_steps=100_000,
     )
     trainer.fit(dt_model, dl)
