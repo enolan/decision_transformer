@@ -43,22 +43,17 @@ class DecisionTransformer(pl.LightningModule):
         self,
         d_model,
         n_head,
+        dim_feedforward,
         n_layers,
         clip_model,
         vqgan_model,
         output_resolution,
-        min_learning_rate=1e-2,
-        max_learning_rate=1e-1,
-        step_size=500,
     ):
         super().__init__()
 
         self.vqgan_model = vqgan_model
         self.clip_model = clip_model
         self.d_model = d_model
-        self.min_learning_rate = min_learning_rate
-        self.max_learning_rate = max_learning_rate
-        self.step_size = step_size
 
         # A linear layer embedding CLIP embeddings into our space.
         self.clip_embedding_linear = torch.nn.Linear(

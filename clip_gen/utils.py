@@ -1,3 +1,4 @@
+from collections import deque
 from pathlib import Path
 import pytorch_lightning as pl
 import torch
@@ -27,10 +28,11 @@ class CheckGradients(pl.Callback):
     """Callback to log gradient norm to Tensorboard and optionally generate an
     SVG chart broken down by each weight."""
 
-    def __init__(self, generate_charts=False, clip_at=None):
+    def __init__(self, generate_charts=False, clip_percentile=None):
         super().__init__()
         self.generate_charts = generate_charts
-        self.clip_at = clip_at
+        self.norms = deque()
+        self.clip_percentile = clip_percentile
 
     def on_before_optimizer_step(self, trainer, pl_module, optimizer, opt_idx):
         if pl_module.global_step % 100 == 0 and self.generate_charts:
@@ -39,16 +41,19 @@ class CheckGradients(pl.Callback):
             plt.clf()
 
         grad_norm, params = self._compute_grad_norm(pl_module.named_parameters())
-        if self.clip_at is not None and grad_norm > self.clip_at:
+        pl_module.log("grad/raw_norm", grad_norm, on_step=True, on_epoch=False)
+        clip_level = self._process_norm(grad_norm)
+        pl_module.log("grad/clip_level", clip_level, on_step=True, on_epoch=False)
+        if clip_level < grad_norm:
             print(
-                f"Gradient norm {grad_norm} at step {pl_module.global_step}, clipping"
+                f"Grad norm was {grad_norm} at {pl_module.global_step}, above {100 * self.clip_percentile:.0f}%ile value {clip_level}, clipping."
             )
-            torch.nn.utils.clip_grad_norm_(params, max_norm=self.clip_at)
+            torch.nn.utils.clip_grad_norm_(params, max_norm=clip_level)
             new_norm = self._compute_grad_norm(pl_module.named_parameters())[0]
             print(f"New gradient norm is {new_norm}.")
-            pl_module.log("grad_norm", new_norm, on_step=True)
+            pl_module.log("grad/clipped_norm", new_norm, on_step=True, on_epoch=False)
         else:
-            pl_module.log("grad_norm", grad_norm, on_step=True)
+            pl_module.log("grad/clipped_norm", grad_norm, on_step=True, on_epoch=False)
 
     def _compute_grad_norm(self, named_params):
         grads = []
@@ -58,6 +63,22 @@ class CheckGradients(pl.Callback):
                 grads.append(param.grad.view(-1))
                 params.append(param)
         return torch.linalg.vector_norm(torch.cat(grads)), params
+
+    def _process_norm(self, this_norm):
+        # This is inefficient but I think it'll be dwarfed by the runtime of
+        # the actual forward+backward passes.
+        if torch.isnan(this_norm) or self.clip_percentile is None:
+            return float("inf")
+        else:
+            if len(self.norms) < 20:
+                ret = float("inf")
+            else:
+                sorted_norms = list(sorted(self.norms))
+                ret = sorted_norms[int(len(self.norms) * self.clip_percentile)]
+            self.norms.append(this_norm)
+            if len(self.norms) > 100:
+                self.norms.popleft()
+            return ret
 
 
 # Debugging function from https://discuss.pytorch.org/t/check-gradient-flow-in-network/15063/10
