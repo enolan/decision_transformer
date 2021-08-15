@@ -494,10 +494,8 @@ class PositionalAndAutoregressiveModel(DecisionTransformer):
         vqgan_tokens = vqgan_tokens.reshape(batch_size, -1)
 
         inputs = self.positional.repeat(batch_size, 1, 1)
-        # print(f"inputs {inputs.shape}")
 
         vqgan_tokens_encoded = self.vqgan_embedding(vqgan_tokens)
-        # print(f"vqgan_tokens_encoded {vqgan_tokens_encoded.shape}")
         inputs[:, 2:] = vqgan_tokens_encoded + inputs[:, 2:]
 
         encoded = self.encoder(inputs, mask=self.attn_mask)
