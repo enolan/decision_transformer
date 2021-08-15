@@ -88,7 +88,11 @@ class DecisionTransformer(pl.LightningModule):
         )
 
         transformer_encoder_layer = torch.nn.TransformerEncoderLayer(
-            d_model, n_head, batch_first=True, activation="gelu"
+            d_model,
+            n_head,
+            batch_first=True,
+            activation="gelu",
+            dim_feedforward=dim_feedforward,
         )
         self.encoder = torch.nn.TransformerEncoder(transformer_encoder_layer, n_layers)
 
@@ -332,21 +336,7 @@ class DecisionTransformer(pl.LightningModule):
         )
 
     def configure_optimizers(self):
-        optimizer = torch.optim.SGD(self.parameters(), lr=self.min_learning_rate)
-        scheduler = torch.optim.lr_scheduler.CyclicLR(
-            optimizer,
-            base_lr=self.min_learning_rate,
-            max_lr=self.max_learning_rate,
-            step_size_up=self.step_size,
-        )
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "step",
-                "frequency": 1,
-            },
-        }
+        return torch.optim.Adam(self.parameters(), lr=3e-4)
 
     def _vqgan_toks_to_image(self, vqgan_toks):
         """Given a tensor of VQGAN tokens, return an image with shape
@@ -367,7 +357,7 @@ def test_can_init_dt():
     clip_model, _clip_preprocessor, vqgan_model = setup_clip_and_vqgan(
         want_vqgan_weights=False
     )
-    DecisionTransformer(16, 4, 4, clip_model, vqgan_model, 64)
+    DecisionTransformer(16, 4, 16, 4, clip_model, vqgan_model, 64)
 
 
 class NoInputModel(DecisionTransformer):
@@ -406,7 +396,7 @@ def test_no_input():
     )
 
     model_res = 64
-    model = NoInputModel(32, 4, 4, clip_model, vqgan_model, model_res)
+    model = NoInputModel(32, 4, 2048, 4, clip_model, vqgan_model, model_res)
 
     dl = DataLoader(
         torchvision.datasets.ImageFolder(
@@ -423,7 +413,7 @@ def test_no_input():
     trainer = pl.Trainer(
         gpus=1,
         log_every_n_steps=1,
-        max_steps=150,
+        max_steps=450,
         precision=16,
         callbacks=[eval_callback, loss_recorder, CheckGradients(generate_charts=False)],
     )
@@ -466,7 +456,7 @@ def test_positional_only():
     )
 
     model_res = 64
-    model = PositionalOnlyModel(32, 4, 4, clip_model, vqgan_model, model_res)
+    model = PositionalOnlyModel(64, 4, 2048, 4, clip_model, vqgan_model, model_res)
 
     dl = DataLoader(
         FilteredImageFolder(
@@ -474,8 +464,9 @@ def test_positional_only():
             transform=lambda img: transform_image(img, model_res),
         ),
         pin_memory=True,
-        batch_size=32,
+        batch_size=64,
         num_workers=8,
+        drop_last=True,
     )
 
     eval_callback = EvalEveryNIts(["a four color square"], model, 100)
@@ -483,12 +474,12 @@ def test_positional_only():
     trainer = pl.Trainer(
         gpus=1,
         log_every_n_steps=1,
-        max_steps=400,
+        max_steps=1_000,
         precision=16,
-        callbacks=[eval_callback, loss_recorder, CheckGradients(generate_charts=False)],
+        callbacks=[eval_callback, loss_recorder, CheckGradients(clip_percentile=0.95)],
     )
     trainer.fit(model, dl)
-    assert loss_recorder.train_loss < 1.4
+    assert loss_recorder.train_loss < 1.2
 
 
 class PositionalAndAutoregressiveModel(DecisionTransformer):
@@ -533,7 +524,7 @@ def test_positional_and_autoregressive():
 
     model_res = 64
     model = PositionalAndAutoregressiveModel(
-        128, 4, 8, clip_model, vqgan_model, model_res
+        256, 8, 2048, 8, clip_model, vqgan_model, model_res
     )
 
     dl = DataLoader(
@@ -553,17 +544,16 @@ def test_positional_and_autoregressive():
     trainer = pl.Trainer(
         gpus=1,
         log_every_n_steps=1,
-        max_steps=2_000,
+        max_steps=9_000,
         precision=16,
         callbacks=[
             eval_callback,
             loss_recorder,
-            CheckGradients(generate_charts=False),
-            pl.callbacks.lr_monitor.LearningRateMonitor(),
+            CheckGradients(clip_percentile=0.95),
         ],
     )
     trainer.fit(model, dl)
-    assert loss_recorder.train_loss < 1.8
+    assert loss_recorder.train_loss < 1.85
 
 
 class EvalEveryNIts(pl.Callback):
@@ -616,8 +606,7 @@ def transform_image(img, target_res):
     smaller_dim = min(img.width, img.height)
     transform = torchvision.transforms.Compose(
         [
-            torchvision.transforms.CenterCrop(smaller_dim),
-            #            torchvision.transforms.RandomCrop(smaller_dim),
+            torchvision.transforms.RandomCrop(smaller_dim),
             torchvision.transforms.Resize((target_res, target_res)),
         ]
     )
