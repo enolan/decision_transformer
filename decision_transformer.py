@@ -132,6 +132,8 @@ class DecisionTransformer(pl.LightningModule):
             clip_fuzzed_targets, dim=1, keepdim=True
         )
 
+        # TODO make the probability that a clip target is shuffled to the same
+        # position it started in independent of batch size.
         clip_fuzzed_targets = clip_fuzzed_targets[torch.randperm(batch_size)]
 
         cos_sims = torch.nn.functional.cosine_similarity(
@@ -291,11 +293,8 @@ class DecisionTransformer(pl.LightningModule):
             vqgan_token_probabilities = self.decoder_vqgan_tokens(encoded.unsqueeze(0))[
                 0
             ]
-            # print(f"vqgan_token_probabilities 1 {vqgan_token_probabilities.shape}")
             vqgan_token_probabilities = vqgan_token_probabilities.softmax(0)
-            # print(f"vqgan_token_probabilities 2 {vqgan_token_probabilities.shape}")
             sampled_tok = vqgan_token_probabilities.multinomial(1)[0]
-            # print(f"sampled_tok {sampled_tok}")
             toks[0, i + 2] = toks[0, i + 2] + self.vqgan_embedding(sampled_tok)
             vqgan_toks.append(sampled_tok)
 
@@ -511,7 +510,6 @@ class PositionalAndAutoregressiveModel(DecisionTransformer):
         self._enable_dropout()
 
         toks = torch.clone(self.positional).unsqueeze(0)
-        # print(f"toks {toks.shape}")
         vqgan_toks = self._sample_img(toks)
 
         return self._vqgan_toks_to_image(vqgan_toks)
