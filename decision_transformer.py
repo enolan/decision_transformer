@@ -1,10 +1,12 @@
 import clip
+import inspect
 import math
 from omegaconf import OmegaConf
 import os
 from pathlib import Path
 import PIL
 import pytorch_lightning as pl
+from pytorch_lightning.loggers import WandbLogger
 import matplotlib
 from matplotlib.lines import Line2D
 from matplotlib import pyplot as plt
@@ -16,6 +18,8 @@ import torch.nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 import torchvision
+from tqdm import tqdm
+import wandb
 
 from clip_gen.positional_encoding import gen_positional_encoding
 from clip_gen.utils import CheckGradients, FilteredImageFolder, TrainLossRecorder
@@ -41,34 +45,36 @@ class DecisionTransformer(pl.LightningModule):
 
     def __init__(
         self,
-        d_model,
-        n_head,
-        dim_feedforward,
-        n_layers,
+        config,
         clip_model,
         vqgan_model,
-        output_resolution,
     ):
         super().__init__()
+        self.save_hyperparameters(config)
+
+        wandb.config.model_version = type(self).__name__
+        wandb.config.update(config)
 
         self.vqgan_model = vqgan_model
         self.clip_model = clip_model
-        self.d_model = d_model
+        self.d_model = config["d_model"]
 
         # A linear layer embedding CLIP embeddings into our space.
         self.clip_embedding_linear = torch.nn.Linear(
-            clip_model.visual.output_dim, d_model, bias=False
+            clip_model.visual.output_dim, self.d_model, bias=False
         )
         # A linear layer embedding CLIP similarities
-        self.clip_similarity_linear = torch.nn.Linear(1, d_model, bias=False)
+        self.clip_similarity_linear = torch.nn.Linear(1, self.d_model, bias=False)
         # Embedding for VQGAN tokens
-        self.vqgan_embedding = torch.nn.Embedding(vqgan_model.quantize.n_embed, d_model)
+        self.vqgan_embedding = torch.nn.Embedding(
+            vqgan_model.quantize.n_embed, self.d_model
+        )
 
         # How wide are the VQGAN patches?
         vqgan_token_size = 2 ** (vqgan_model.decoder.num_resolutions - 1)
-        assert output_resolution % vqgan_token_size == 0
+        assert config["output_resolution"] % vqgan_token_size == 0
         # How many VQGAN tokens are there in an image?
-        self.vqgan_tokens = (output_resolution // vqgan_token_size) ** 2
+        self.vqgan_tokens = (config["output_resolution"] // vqgan_token_size) ** 2
 
         self.setup_positional_encoding()
         self.setup_attention_mask()
@@ -88,18 +94,20 @@ class DecisionTransformer(pl.LightningModule):
         )
 
         transformer_encoder_layer = torch.nn.TransformerEncoderLayer(
-            d_model,
-            n_head,
+            config["d_model"],
+            config["n_head"],
             batch_first=True,
             activation="gelu",
-            dim_feedforward=dim_feedforward,
+            dim_feedforward=config["dim_feedforward"],
         )
-        self.encoder = torch.nn.TransformerEncoder(transformer_encoder_layer, n_layers)
+        self.encoder = torch.nn.TransformerEncoder(
+            transformer_encoder_layer, config["n_layers"]
+        )
 
         self.decoder_vqgan_tokens = torch.nn.Linear(
-            d_model, vqgan_model.quantize.n_embed, bias=False
+            self.d_model, vqgan_model.quantize.n_embed, bias=False
         )
-        self.decoder_cos_sim = torch.nn.Linear(d_model, 1)
+        self.decoder_cos_sim = torch.nn.Linear(self.d_model, 1)
 
     def training_step(self, batch, batch_idx):
         imgs_tensor, _ = batch
@@ -140,8 +148,11 @@ class DecisionTransformer(pl.LightningModule):
             clip_embeddings, clip_embeddings  # clip_fuzzed_targets
         ).unsqueeze(1)
 
-        self.logger.experiment.add_histogram(
-            "train/cos_sim_in", cos_sims[:, 0], global_step=self.global_step
+        self.logger.experiment.log(
+            {
+                "train.cos_sim_in": wandb.Histogram(cos_sims[:, 0].detach().cpu()),
+                "global_step": self.global_step,
+            }
         )
 
         vqgan_tokenses = vqgan_tokenses.reshape(batch_size, -1)
@@ -153,14 +164,6 @@ class DecisionTransformer(pl.LightningModule):
             [targets_e.unsqueeze(1), cos_sims_e.unsqueeze(1), tokenses_e], axis=1
         )
 
-        # for tok_idx in range(0, self.vqgan_tokens + 2, (self.vqgan_tokens + 2) // 8):
-        for tok_idx in range(0, self.vqgan_tokens + 2):
-            self.logger.experiment.add_histogram(
-                f"position {tok_idx} positional channels",
-                self.positional[tok_idx, :],
-                global_step=self.global_step,
-            )
-
         inputs = inputs + self.positional
 
         encoded = self.encoder(inputs, mask=self.attn_mask)
@@ -168,11 +171,14 @@ class DecisionTransformer(pl.LightningModule):
         # all predictions are offset by 1. I.e. output n is a prediction for
         # token n + 1
         cos_sim_pred = self.decoder_cos_sim(encoded)[:, 0]
-        self.logger.experiment.add_histogram(
-            "train/cos_sim_pred", cos_sim_pred, global_step=self.global_step
+        self.logger.experiment.log(
+            {
+                "train.cos_sim_pred": wandb.Histogram(cos_sim_pred.detach().cpu()),
+                "global_step": self.global_step,
+            }
         )
         cos_sim_loss = F.mse_loss(cos_sim_pred, cos_sims)
-        self.log("train/cos_sim_loss", cos_sim_loss)
+        self.log("train.cos_sim_loss", cos_sim_loss)
 
         patches_loss = self._compute_vqgan_loss(encoded)
 
@@ -181,7 +187,7 @@ class DecisionTransformer(pl.LightningModule):
 
         loss = patches_loss  # cos_sim_loss + patches_loss  # mess with the scaling constant?
         assert not loss.isnan().item()
-        self.log("train/loss", loss)
+        self.log("train.loss", loss)
         return loss
 
     def _encode_with_vqgan(self, imgs):
@@ -206,13 +212,14 @@ class DecisionTransformer(pl.LightningModule):
         # Stick a reconstructed example in TensorBoard for debug purposes
         if random.random() <= 0.01:
             idx = random.randint(0, imgs.shape[0] - 1)
-            self.logger.experiment.add_image(
-                f"sampled_original_img", imgs[idx], global_step=self.global_step
-            )
-            self.logger.experiment.add_image(
-                f"sampled_reconstructed_img",
-                ((reconstructed_imgs[idx] + 1) / 2).clamp(0, 1),
-                global_step=self.global_step,
+            self.logger.experiment.log(
+                {
+                    "sampled_original_img": wandb.Image(imgs[idx]),
+                    "sampled_reconstructed_img": wandb.Image(
+                        ((reconstructed_imgs[idx] + 1) / 2).clamp(0, 1)
+                    ),
+                    "global_step": self.global_step,
+                }
             )
         return vqgan_tokens, reconstructed_imgs
 
@@ -236,12 +243,15 @@ class DecisionTransformer(pl.LightningModule):
             )
         patch_losses = torch.cat(patch_losses)
 
-        self.logger.experiment.add_histogram(
-            "train/patch_losses", patch_losses, global_step=self.global_step
+        self.logger.experiment.log(
+            {
+                "train.patch_losses": wandb.Histogram(patch_losses.detach().cpu()),
+                "global_step": self.global_step,
+            }
         )
 
         patches_loss = patch_losses.mean()
-        self.log("train/patches_loss", patches_loss)
+        self.log("train.patches_loss", patches_loss)
 
         return patches_loss
 
@@ -276,7 +286,7 @@ class DecisionTransformer(pl.LightningModule):
 
         return self._vqgan_toks_to_image(vqgan_toks)
 
-    def _sample_img(self, toks):
+    def _sample_img(self, toks, top_p):
         """Sample an image given a vector of input tokens with everything
         before the VQGAN tokens filled in. Mutates toks.
         SHAPES:
@@ -287,18 +297,45 @@ class DecisionTransformer(pl.LightningModule):
         vqgan_toks = []
 
         for i in range(self.vqgan_tokens):
-            # Could do top-p sampling here, or one of the other ones. Doing the
-            # simplest approach for now.
             encoded = self.encoder(toks, mask=self.attn_mask)[0, i + 1]
             vqgan_token_probabilities = self.decoder_vqgan_tokens(encoded.unsqueeze(0))[
                 0
             ]
             vqgan_token_probabilities = vqgan_token_probabilities.softmax(0)
-            sampled_tok = vqgan_token_probabilities.multinomial(1)[0]
+
+            filtered_token_probabilities = self._filter_top_p(
+                vqgan_token_probabilities, top_p
+            )
+
+            sampled_tok = filtered_token_probabilities.multinomial(1)[0]
             toks[0, i + 2] = toks[0, i + 2] + self.vqgan_embedding(sampled_tok)
             vqgan_toks.append(sampled_tok)
 
         return torch.stack(vqgan_toks)
+
+    def _filter_top_p(self, probabilities, p):
+        """Given a 1-d tensor of proabilities, return a tensor with the top p
+        selected and rescaled and all others set to zero.
+        """
+        if p < 1.0:
+            # Indexing into Torch tensors is hideously slow for some reason:
+            # https://github.com/pytorch/pytorch/issues/29973. So we copy them
+            # to CPU and use numpy.
+            probabilities = np.asarray(probabilities.cpu())
+            sort_idxs = np.argsort(probabilities)[::-1]
+            probability_so_far = 0.0
+            filtered_token_probabilities = np.zeros(probabilities.shape[0])
+            for i in sort_idxs:
+                probability_so_far = probability_so_far + probabilities[i]
+                filtered_token_probabilities[i] = probabilities[i]
+                if probability_so_far >= p:
+                    break
+            filtered_token_probabilities = torch.tensor(
+                filtered_token_probabilities / probability_so_far, device=self.device
+            )
+        else:
+            filtered_token_probabilities = vqgan_token_probabilities
+        return filtered_token_probabilities
 
     def _sample_img_without_autoregression(self, toks):
         """Same as _sample_img, but does not generate the image progressively
@@ -320,7 +357,9 @@ class DecisionTransformer(pl.LightningModule):
         # Originally I had special encodings for the CLIP target and similarity
         # but I nixed them for simplicity. Probably doesn't matter.
         self.register_buffer(
-            "positional", gen_positional_encoding(self.d_model, self.vqgan_tokens + 2)
+            "positional",
+            gen_positional_encoding(self.d_model, self.vqgan_tokens + 2),
+            persistent=False,
         )
 
     def setup_attention_mask(self):
@@ -335,7 +374,7 @@ class DecisionTransformer(pl.LightningModule):
         )
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=3e-4)
+        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
 
     def _vqgan_toks_to_image(self, vqgan_toks):
         """Given a tensor of VQGAN tokens, return an image with shape
@@ -350,13 +389,35 @@ class DecisionTransformer(pl.LightningModule):
         img = ((self.vqgan_model.decode(z)[0] + 1) / 2).clamp(0, 1)
         return img
 
+    def on_save_checkpoint(self, checkpoint):
+        out_state_dict = {}
+        for k, v in checkpoint["state_dict"].items():
+            if not (k.startswith("clip_model") or k.startswith("vqgan_model")):
+                out_state_dict[k] = v
+        checkpoint["state_dict"] = out_state_dict
+
+
+def init_wandb_for_test(record=True):
+    if record:
+        mode = "online"
+    else:
+        mode = "disabled"
+    wandb.init(
+        reinit=True,
+        mode=mode,
+        job_type="unit_test",
+        config={"test_name": inspect.stack()[1][3]},
+    )
+    return WandbLogger()
+
 
 def test_can_init_dt():
     "Check setting up a DT module works"
     clip_model, _clip_preprocessor, vqgan_model = setup_clip_and_vqgan(
         want_vqgan_weights=False
     )
-    DecisionTransformer(16, 4, 16, 4, clip_model, vqgan_model, 64)
+    init_wandb_for_test(record=False)
+    DecisionTransformer(config_tiny, clip_model, vqgan_model)
 
 
 class NoInputModel(DecisionTransformer):
@@ -381,7 +442,7 @@ class NoInputModel(DecisionTransformer):
 
         return patches_loss
 
-    def forward(self, _target_clip_embedding, text=None):
+    def forward(self, _target_clip_embedding, text=None, top_p=1.0):
         inputs = torch.zeros(1, self.vqgan_tokens + 2, self.d_model, device=self.device)
 
         vqgan_tokens = self._sample_img_without_autoregression(inputs)
@@ -394,27 +455,21 @@ def test_no_input():
         want_vqgan_weights=True
     )
 
-    model_res = 64
-    model = NoInputModel(32, 4, 2048, 4, clip_model, vqgan_model, model_res)
+    logger = init_wandb_for_test()
+    cfg = config_tiny | {"lr": 5e-3}
+    model = NoInputModel(cfg, clip_model, vqgan_model)
 
-    dl = DataLoader(
-        torchvision.datasets.ImageFolder(
-            "debug_test_data/all-white",
-            transform=lambda img: transform_image(img, model_res),
-        ),
-        pin_memory=True,
-        batch_size=64,
-        num_workers=8,
-    )
+    dl = setup_dataloader("debug_test_data/all-white", 64, cfg["output_resolution"])
 
     eval_callback = EvalEveryNIts(["a white square"], model, 100)
     loss_recorder = TrainLossRecorder()
     trainer = pl.Trainer(
         gpus=1,
         log_every_n_steps=1,
-        max_steps=450,
+        max_steps=100,
         precision=16,
         callbacks=[eval_callback, loss_recorder, CheckGradients(generate_charts=False)],
+        logger=logger,
     )
     trainer.fit(model, dl)
     assert loss_recorder.train_loss < 3.8
@@ -443,7 +498,7 @@ class PositionalOnlyModel(DecisionTransformer):
 
         return patches_loss
 
-    def forward(self, _target_clip_embedding, text=None):
+    def forward(self, _target_clip_embedding, text=None, top_p=1.0):
         inputs = self.positional.unsqueeze(0)
         vqgan_tokens = self._sample_img_without_autoregression(inputs)
         return self._vqgan_toks_to_image(vqgan_tokens)
@@ -454,28 +509,20 @@ def test_positional_only():
         want_vqgan_weights=True
     )
 
-    model_res = 64
-    model = PositionalOnlyModel(64, 4, 2048, 4, clip_model, vqgan_model, model_res)
+    logger = init_wandb_for_test()
+    cfg = config_small
+    model = PositionalOnlyModel(cfg, clip_model, vqgan_model)
 
-    dl = DataLoader(
-        FilteredImageFolder(
-            "debug_test_data/4 colors",
-            transform=lambda img: transform_image(img, model_res),
-        ),
-        pin_memory=True,
-        batch_size=64,
-        num_workers=8,
-        drop_last=True,
-    )
-
+    dl = setup_dataloader("debug_test_data/4 colors", 64, cfg["output_resolution"])
     eval_callback = EvalEveryNIts(["a four color square"], model, 100)
     loss_recorder = TrainLossRecorder()
     trainer = pl.Trainer(
         gpus=1,
         log_every_n_steps=1,
-        max_steps=1_000,
+        max_steps=250,
         precision=16,
         callbacks=[eval_callback, loss_recorder, CheckGradients(clip_percentile=0.95)],
+        logger=logger,
     )
     trainer.fit(model, dl)
     assert loss_recorder.train_loss < 1.2
@@ -504,11 +551,11 @@ class PositionalAndAutoregressiveModel(DecisionTransformer):
 
         return patches_loss
 
-    def forward(self, _target_clip_embedding, text=None):
+    def forward(self, _target_clip_embedding, text=None, top_p=1.0):
         self._enable_dropout()
 
         toks = torch.clone(self.positional).unsqueeze(0)
-        vqgan_toks = self._sample_img(toks)
+        vqgan_toks = self._sample_img(toks, top_p)
 
         return self._vqgan_toks_to_image(vqgan_toks)
 
@@ -518,23 +565,15 @@ def test_positional_and_autoregressive():
         want_vqgan_weights=True
     )
 
-    model_res = 64
-    model = PositionalAndAutoregressiveModel(
-        256, 8, 2048, 8, clip_model, vqgan_model, model_res
-    )
+    logger = init_wandb_for_test()
+    cfg = config_medium_small
+    model = PositionalAndAutoregressiveModel(cfg, clip_model, vqgan_model)
 
-    dl = DataLoader(
-        FilteredImageFolder(
-            "debug_test_data/diverse",  # "diverse" means 32 copies of 32 images
-            transform=lambda img: transform_image(img, model_res),
-        ),
-        pin_memory=True,
-        batch_size=64,
-        drop_last=True,
-        num_workers=8,
-        shuffle=True,
+    dl = setup_dataloader(
+        "debug_test_data/diverse",  # "diverse" means 32 copies of 32 images
+        64,
+        cfg["output_resolution"],
     )
-
     eval_callback = EvalEveryNIts(["a four color square"], model, 500)
     loss_recorder = TrainLossRecorder()
     trainer = pl.Trainer(
@@ -547,6 +586,7 @@ def test_positional_and_autoregressive():
             loss_recorder,
             CheckGradients(clip_percentile=0.95),
         ],
+        logger=logger,
     )
     trainer.fit(model, dl)
     assert loss_recorder.train_loss < 1.85
@@ -566,16 +606,25 @@ class EvalEveryNIts(pl.Callback):
         self, trainer, pl_module, batch, batch_idx, dataloader_idx
     ):
         if pl_module.global_step % self.n == 0:
+            print(f"generating eval images at {pl_module.global_step}")
             with torch.no_grad():
                 pl_module.eval()
-                for prompt in self.prompts:
-                    for i in range(8):
-                        img = pl_module(prompt["embedding"], text=prompt["prompt"])
-                        pl_module.logger.experiment.add_image(
-                            f"{prompt['prompt']}-{i}",
-                            img,
-                            global_step=pl_module.global_step,
-                        )
+                for prompt in tqdm(self.prompts, leave=False):
+                    log_dict = {"global_step": pl_module.global_step}
+                    for p in tqdm([0.5, 0.75, 0.85, 0.95], leave=False):
+                        imgs = []
+                        for _ in range(2):
+                            imgs.append(
+                                wandb.Image(
+                                    pl_module(
+                                        prompt["embedding"],
+                                        text=prompt["prompt"],
+                                        top_p=p,
+                                    )
+                                )
+                            )
+                        log_dict[f"eval-images.{prompt['prompt']}.top-{p:.2f}"] = imgs
+                    pl_module.logger.experiment.log(log_dict)
                 pl_module.train()
 
 
@@ -609,26 +658,79 @@ def transform_image(img, target_res):
     return torchvision.transforms.functional.to_tensor(transform(img))
 
 
+config_tiny = {
+    "d_model": 16,
+    "n_head": 4,
+    "dim_feedforward": 16,
+    "n_layers": 4,
+    "output_resolution": 64,
+    "lr": 1e-3,
+}
+
+config_small = {
+    "d_model": 64,
+    "n_head": 4,
+    "dim_feedforward": 2048,
+    "n_layers": 4,
+    "output_resolution": 64,
+    "lr": 1e-3,
+}
+
+config_medium_small = {
+    "d_model": 256,
+    "n_head": 8,
+    "dim_feedforward": 2048,
+    "n_layers": 8,
+    "output_resolution": 64,
+    "lr": 3e-4,
+}
+
+# stole these hyperparameters from GPT-1, modulo the layer count which is 12 in
+# their implementation
+config_medium = {
+    "d_model": 768,
+    "n_head": 12,
+    "dim_feedforward": 3072,
+    "n_layers": 8,
+    "output_resolution": 128,
+    "lr": 1e-3,  # lr *not* from GPT
+}
+
+
+def setup_dataloader(path, batch_size, output_res):
+    wandb.config.update({"data_path": path, "batch_size": batch_size})
+    return DataLoader(
+        FilteredImageFolder(
+            path,
+            transform=lambda img: transform_image(img, output_res),
+        ),
+        pin_memory=True,
+        batch_size=batch_size,
+        num_workers=8,
+        shuffle=True,
+        drop_last=True,
+    )
+
+
 if __name__ == "__main__":
 
     matplotlib.use("svg")
 
-    output_res = 128
     clip_model, clip_preprocessor, vqgan_model = setup_clip_and_vqgan(
         want_vqgan_weights=True
     )
-    # stole these hyperparameters from GPT-1, modulo the layer count which is
-    # 12 in their implementation
 
+    cfg = config_medium
+
+    wandb.init()
     dt_model = PositionalAndAutoregressiveModel(
-        768,
-        12,
-        3072,
-        6,
+        cfg,
         clip_model,
         vqgan_model,
-        output_res,
     )
+
+    wandb.watch(dt_model, log_freq=100)
+    wandb_logger = WandbLogger()
 
     eval_callback = EvalEveryNIts(
         [
@@ -645,16 +747,10 @@ if __name__ == "__main__":
         1000,
     )
 
-    dl = DataLoader(
-        FilteredImageFolder(
-            "/home/enolan/mystuff/code/clip-gen/debug_test_data/cats",
-            transform=lambda img: transform_image(img, output_res),
-        ),
-        pin_memory=True,
-        batch_size=16,
-        num_workers=8,
-        shuffle=True,
-        drop_last=True,
+    dl = setup_dataloader(
+        "/home/enolan/mystuff/code/clip-gen/debug_test_data/cats",
+        16,
+        cfg["output_resolution"],
     )
 
     trainer = pl.Trainer(
@@ -666,5 +762,6 @@ if __name__ == "__main__":
         ],
         precision=16,
         max_steps=100_000,
+        logger=wandb_logger,
     )
     trainer.fit(dt_model, dl)
