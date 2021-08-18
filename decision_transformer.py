@@ -374,7 +374,21 @@ class DecisionTransformer(pl.LightningModule):
         )
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+        if self.hparams.optimizer == "sgd":
+            return torch.optim.SGD(self.parameters(), lr=self.hparams.lr)
+        elif self.hparams.optimizer == "sgd-cyclic":
+            opt = torch.optim.SGD(self.parameters(), lr=self.hparams.lr)
+            return {
+                "optimizer": optim,
+                "scheduler": torch.optim.lr_scheduler.CyclicLR(
+                    optim,
+                    base_lr=self.hparams.lr,
+                    max_lr=self.hparams.lr * self.hparams.cyclic_upper_factor,
+                    step_size_up=self.hparams.cyclic_stepsize,
+                ),
+            }
+        elif self.hparams.optimizer == "adam":
+            return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
 
     def _vqgan_toks_to_image(self, vqgan_toks):
         """Given a tensor of VQGAN tokens, return an image with shape
@@ -596,6 +610,10 @@ class EvalEveryNIts(pl.Callback):
     def __init__(self, prompts, model, n):
         self.n = n
         self.prompts = []
+        # Track the last time we evaluated, since global_step is not
+        # incremented between accumulating training batches this function is
+        # called multiple times in a row.
+        self.last_iter_evaled = -1
         with torch.no_grad():
             for prompt in prompts:
                 tokens = clip.tokenize([prompt]).cuda()
@@ -605,7 +623,10 @@ class EvalEveryNIts(pl.Callback):
     def on_train_batch_start(
         self, trainer, pl_module, batch, batch_idx, dataloader_idx
     ):
-        if pl_module.global_step % self.n == 0:
+        if (
+            pl_module.global_step % self.n == 0
+            and pl_module.global_step != self.last_iter_evaled
+        ):
             print(f"generating eval images at {pl_module.global_step}")
             with torch.no_grad():
                 pl_module.eval()
@@ -625,6 +646,7 @@ class EvalEveryNIts(pl.Callback):
                             )
                         log_dict[f"eval-images.{prompt['prompt']}.top-{p:.2f}"] = imgs
                     pl_module.logger.experiment.log(log_dict)
+                self.last_iter_evaled = pl_module.global_step
                 pl_module.train()
 
 
@@ -693,22 +715,57 @@ config_medium = {
     "dim_feedforward": 3072,
     "n_layers": 8,
     "output_resolution": 128,
-    "lr": 1e-3,  # lr *not* from GPT
+    # GPT params end here
+    "lr": 0.01,
+    "batch_size": 19,
+    "accumulate_grad_batches": 2,
+    "clip_percentile": 0.90,
 }
 
 
-def setup_dataloader(path, batch_size, output_res):
-    wandb.config.update({"data_path": path, "batch_size": batch_size})
+def setup_dataloader(path, cfg):
+    batch_size = cfg["batch_size"]
+    wandb.config.update({"data_path": path})
     return DataLoader(
         FilteredImageFolder(
             path,
-            transform=lambda img: transform_image(img, output_res),
+            transform=lambda img: transform_image(img, cfg["output_resolution"]),
         ),
         pin_memory=True,
         batch_size=batch_size,
         num_workers=8,
         shuffle=True,
         drop_last=True,
+    )
+
+
+def setup_trainer(model, cfg):
+    eval_callback = EvalEveryNIts(
+        [
+            "a smiling woman"
+            # "a sad man's face",
+            # "a group of women",
+            # "a man giving a speech",
+            # "a bouquet of roses",
+            # "Manhattan at sunset #pentax67",
+            # "a painting inspired by a 5-MeO-DMT trip",
+            # "Burning Man 2018 #artcar #pentax67",
+        ],
+        model,
+        1000,
+    )
+
+    return pl.Trainer(
+        gpus=1,
+        log_every_n_steps=1,
+        callbacks=[
+            eval_callback,
+            CheckGradients(clip_percentile=cfg["clip_percentile"]),
+        ],
+        precision=16,
+        max_steps=10_000 // cfg["accumulate_grad_batches"], #Set for sweep
+        logger=wandb_logger,
+        accumulate_grad_batches=cfg["accumulate_grad_batches"],
     )
 
 
@@ -720,17 +777,18 @@ if __name__ == "__main__":
         want_vqgan_weights=True
     )
 
-    cfg = config_medium
 
-    wandb.init()
+    wandb.init(config=config_medium)
+    cfg = dict(wandb.config)
     dt_model = PositionalAndAutoregressiveModel(
         cfg,
         clip_model,
         vqgan_model,
     )
+    # dt_model = PositionalAndAutoregressiveModel.load_from_checkpoint("clip-gen/ajt1sptm/checkpoints/epoch=408-step=16768.ckpt", clip_model=clip_model, vqgan_model=vqgan_model, strict=False)
 
     wandb.watch(dt_model, log_freq=100)
-    wandb_logger = WandbLogger()
+    wandb_logger = WandbLogger(log_model=True)
 
     eval_callback = EvalEveryNIts(
         [
@@ -748,20 +806,8 @@ if __name__ == "__main__":
     )
 
     dl = setup_dataloader(
-        "/home/enolan/mystuff/code/clip-gen/debug_test_data/cats",
-        16,
-        cfg["output_resolution"],
+        "/home/enolan/mystuff/code/clip-gen/debug_test_data/cats", cfg
     )
 
-    trainer = pl.Trainer(
-        gpus=1,
-        log_every_n_steps=1,
-        callbacks=[
-            eval_callback,
-            CheckGradients(clip_percentile=0.95),
-        ],
-        precision=16,
-        max_steps=100_000,
-        logger=wandb_logger,
-    )
+    trainer = setup_trainer(dt_model, cfg)
     trainer.fit(dt_model, dl)
